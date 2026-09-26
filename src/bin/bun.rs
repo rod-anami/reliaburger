@@ -986,6 +986,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
     let mut api_membership: Option<Arc<RwLock<Vec<api::NodeMembershipInfo>>>> = None;
+    let mut api_known_members: Option<api::KnownMembers> = None;
     // Handles the orchestration tasks need, captured before the
     // ClusterHandle moves into the agent (spawned further down, once
     // the service token exists).
@@ -1315,6 +1316,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
+        let known_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        api_known_members = Some(api::KnownMembers(Arc::clone(&known_table)));
         let mut refresher_rx = membership_rx;
         // Each node advertises its real API endpoint over gossip (the
         // directory, 12b.2). Prefer that authoritative `api_address`: a
@@ -1326,23 +1330,38 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let refresher_shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let snapshot: Vec<api::NodeMembershipInfo> = {
+                use reliaburger::mustard::state::NodeState;
+                let (snapshot, known): (Vec<_>, Vec<_>) = {
                     let directory = refresher_directory_rx.borrow();
                     refresher_rx
                         .borrow()
                         .iter()
-                        .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                        .map(|m| api::NodeMembershipInfo {
-                            node_id: m.node_id.clone(),
-                            address: directory.api_address(
-                                &m.node_id,
-                                m.address,
-                                gossip_to_api_offset,
-                            ),
+                        .filter(|m| m.state != NodeState::Left)
+                        .map(|m| {
+                            let info = api::NodeMembershipInfo {
+                                node_id: m.node_id.clone(),
+                                address: directory.api_address(
+                                    &m.node_id,
+                                    m.address,
+                                    gossip_to_api_offset,
+                                ),
+                                api_advertised: directory.endpoints.contains_key(&m.node_id),
+                            };
+                            (m.state == NodeState::Alive, info)
                         })
-                        .collect()
+                        .partition(|(alive, _)| *alive)
                 };
+                // Live members for fan-out; every known member for the relay
+                // and fault reversal, which must reach a node-killed peer.
+                let snapshot: Vec<api::NodeMembershipInfo> =
+                    snapshot.into_iter().map(|(_, info)| info).collect();
+                let known: Vec<api::NodeMembershipInfo> = snapshot
+                    .iter()
+                    .cloned()
+                    .chain(known.into_iter().map(|(_, info)| info))
+                    .collect();
                 *membership_table.write().await = snapshot;
+                *known_table.write().await = known;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
                     changed = refresher_rx.changed() => {
@@ -1386,6 +1405,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 shutdown.clone(),
                 cluster_http.clone(),
                 Some(data_base.clone()),
+                config.runtime.stop_confirmation_timeout(),
             );
         }
     }
@@ -1666,15 +1686,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // explicitly just before flushing.
     let mut feeder_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Drain container log lines from the agent into the LogStore.
+    // Drain container log lines from the agent into the LogStore. The store
+    // skips lines it already holds, which a forwarder re-reads after a restart.
     {
         let drain_store = Arc::clone(&log_store);
         feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
-                drain_store
-                    .write()
-                    .await
-                    .append(&rec.app, &rec.namespace, rec.stream, &rec.line);
+                drain_store.write().await.ingest(&rec);
             }
         }));
     }
@@ -1958,6 +1976,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             Ok(result) if result.files_exported > 0 => {
                                 println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
                             }
+                            // Disk-pressure relief (or a manual export) holds the
+                            // checkpoint and is shipping these same files; the
+                            // next tick picks up anything it missed.
+                            Err(reliaburger::ketchup::types::KetchupError::ExportBusy) => {}
                             Err(e) => eprintln!("bun: log export error: {e}"),
                             _ => {}
                         }
@@ -2413,6 +2435,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match capacity_admission {
         Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
+    };
+    let app = match api_known_members {
+        Some(known) => app.layer(axum::Extension(known)),
         None => app,
     };
     let app = match &api_identity {

@@ -116,7 +116,7 @@ Reliaburger requires **two** signatures on every network-distributed binary, fro
 1. **The embedded release key.** A set of Ed25519 public keys compiled into the binary itself. Signature by one of these proves the file came out of the Reliaburger release process. If this key leaks, the *project* has a problem.
 2. **The external key.** An Ed25519 public key the operator generates themselves and puts in `node.toml` (`upgrades.external_signing_key`). Signature by this proves *this cluster's operator* approved *this specific binary*. If this key leaks, one organisation has a problem — and rotating it is a config change, not a re-release.
 
-An attacker has to compromise both, and they don't live in the same place. That's the whole design. Air-gapped upgrades (`relish upgrade start --binary`, where an operator hand-carries a file to the cluster) require only the embedded signature — the operator's approval is implicit in the hand-carrying — matching how `UpgradeConfig` was specced in the design doc.
+An attacker has to compromise both, and they don't live in the same place. That's the whole design. Air-gapped upgrades (`relish upgrade start --binary`, where an operator hand-carries a file to the cluster) require only the embedded signature — the operator's approval is implicit in the hand-carrying — matching how `UpgradeConfig` was specced in the design doc. That holds on one node. In a cluster the other nodes fetch the hand-carried file from the registry, which is the network again, so they want both signatures.
 
 Why Ed25519, when Chapter 10's image signing used ECDSA P-256? The image path needed X.509 certificate *chains* — delegation, intermediates, revocation. Binary signing needs none of that; it's a fixed set of raw keys, and for raw keys Ed25519 is the boring, fast, hard-to-misuse choice. We already have an implementation in the tree: `ring`, which has been signing our OIDC tokens since the identity work. No new dependency, no new audit surface.
 
@@ -191,6 +191,33 @@ In a release build that branch collapses to the warning. A production binary's t
 - **A single dual-purpose key.** Two signatures from keys in the same drawer is theatre. Different owners or don't bother.
 
 The tests are the specification again: correct dual signatures verify; a wrong hash fails before any signature work; tampered bytes fail even with a "fixed-up" hash; an unknown release key fails; the second key of a rotation-window set passes; a network upgrade without the external key or signature fails with the right error; air-gapped skips what it may skip and still rejects a present-but-wrong signature. `cargo test --lib upgrade::signing`.
+
+### Countersigning without the release key
+
+For a long while the only signing tool was `relish dev sign-binary --key release.key [--external-key operator.key]`. Look at who holds which key and you'll spot the problem: the release key belongs to the project, the external key to the operator, and the one command that could add the operator's signature demanded both. Nobody outside the project could countersign a release. Our own V02 soak harness walked straight into it: it started every upgrade walk with a release-signed soak build, each node asked for the second signature, and every walk was refused.
+
+So there's a second command, `relish dev countersign-binary --external-key operator.key bun-v0.2.0`, built on one small function:
+
+```rust
+pub fn countersign(
+    envelope: &SignatureEnvelope,
+    external_pkcs8: &[u8],
+    bytes: &[u8],
+) -> Result<SignatureEnvelope, UpgradeError> {
+    let actual = sha256_hex(bytes);
+    if !actual.eq_ignore_ascii_case(&envelope.sha256) {
+        return Err(UpgradeError::HashMismatch { expected: envelope.sha256.clone(), actual });
+    }
+    Ok(SignatureEnvelope {
+        external: Some(sign(external_pkcs8, bytes)?),
+        ..envelope.clone()
+    })
+}
+```
+
+`..envelope.clone()` is the struct update syntax from Chapter 1: every field not named comes from the envelope, so the release signature is copied, never recomputed. The hash check stops you countersigning a `.sig` that belongs to a different binary, which would otherwise produce an envelope that fails on every node.
+
+One more wrinkle. `ring` has two ways to load a PKCS#8 private key: `from_pkcs8`, which insists on version 2 (the document carries the public key, and ring checks it matches), and `from_pkcs8_maybe_unchecked`, which also takes version 1. `openssl genpkey -algorithm ed25519` writes version 1. Operators should be able to make their key with whatever tool they trust, so signing now uses the second. Nothing is lost: a signature that doesn't match the operator's real public key fails verification on every node anyway.
 
 Next: where verified binaries live on disk, and how to swap one in atomically.
 
@@ -519,7 +546,7 @@ pub active_upgrade: Option<ClusterUpgradeState>,
 pub upgrade_history: Vec<ClusterUpgradeState>,
 ```
 
-`ClusterUpgradeState` is the whole plan as data: target version, signatures, worker parallelism, direction (upgrade or rollback), the cluster phase (`Preparing → UpgradingWorkers → UpgradingCouncil → TransferringLeadership → UpgradingLeader → Completed`, with `Paused { reason }` as the escape hatch), and one `NodeUpgradeRecord` per node — role, address, observed version, per-node phase. When leadership moves mid-run, the new leader reads this and continues from exactly where the old one stopped. No handover protocol; the handover *is* the replication that already happened.
+`ClusterUpgradeState` is the whole plan as data: target version, signatures, worker parallelism, direction (upgrade or rollback), the cluster phase (`Preparing → UpgradingWorkers → UpgradingCouncil → TransferringLeadership → UpgradingLeader → Completed`, with `Paused { reason }` as the escape hatch, and `Aborted { reason }` for a pause the operator ended; see "A pause with no way out" at the end of the chapter), and one `NodeUpgradeRecord` per node — role, address, observed version, per-node phase. When leadership moves mid-run, the new leader reads this and continues from exactly where the old one stopped. No handover protocol; the handover *is* the replication that already happened.
 
 Two new log entries drive it, and their design follows the deploy machinery from Chapter 7: `UpgradeUpdate { state }` (last-writer-wins full replacement — only the leader's orchestrator writes, so merging semantics would be complexity without a customer) and `UpgradeClear { upgrade_id }` (archive to bounded history). The clear checks the id: a stale clear racing a newer upgrade must not delete the wrong run.
 
@@ -603,6 +630,12 @@ The lesson is worth more than the feature: when a distributed primitive resists 
 
 `POST /v1/upgrade/start` (admin, leader): the plan — target version, hashes and signatures, `parallel`, the registry address nodes should fetch from, and the node list. The client names *which* nodes to upgrade, but it does **not** get to say what those nodes are. The leader rebuilds each node's role (from the Raft voter set and current leader) and address (from gossip membership) server-side and validates the request against its own view. Why bother? Because the roles decide the rolling order, and the leader-last invariant is load-bearing: a caller who could label a live leader "worker" (or a worker "leader") could make the real leader upgrade first-and-disruptively, or point directives at another host entirely. So a spoofed address, or any claim that crosses the leader boundary, is rejected; a harmless worker↔council relabel among non-leaders is quietly corrected to the authoritative role. Either way the plan the orchestrator walks is built from the leader's truth, never the client's claim. `GET /v1/upgrade/cluster` reads the replicated state from any node. `resume` and `cluster-rollback` do what they say — rollback runs the same walk with `direct_rollback` directives and no distribution step, since every node still has the previous binary on disk (§14.3's retention earning its keep).
 
+There's a catch in "the leader's truth", and a CI run found it for us. The rollback test upgrades a four-node cluster, then immediately asks the leader to roll it back. It got a 400: `address for node "n1" is "127.0.0.1:36685" but the cluster sees "127.0.0.1:45611"`. Port 45611 appeared nowhere in the logs. n1 had listened on 36685 before and after its upgrade. So where did 45611 come from?
+
+From arithmetic. The leader upgrades last, so it had just restarted, and a restarted node learns its peers in two steps. First, some member sends it a membership sync, which says "n1 is alive at gossip port 57888". Later, n1's own gossip arrives, stamped with the API address n1 advertises. Between the two, the membership table fills the gap by shifting the gossip port by the leader's *own* gossip-to-API offset: 57888 + (41165 − 53442) = 45611. That guess is right on a production fleet, where every node uses the same ports, and wrong on any host running several nodes with independently picked ports. The validation compared the client's correct address with the guess and called the client a liar.
+
+The fix keeps the guess where it's harmless and stops it being treated as an identity. `NodeMembershipInfo` now says whether its address was advertised, and the authoritative view carries `address: Option<String>`, built with `member.api_advertised.then(|| member.address.to_string())`. `derive_upgrade_nodes` refuses a node whose address it doesn't know yet with `PlanError::AddressNotAdvertised`, and `PlanError::is_transient` maps that to a 503 ("retry shortly") rather than a 400, because the request isn't wrong, only early. `/v1/cluster/nodes` stopped publishing guesses too, so relish reports "no advertised API endpoint" instead of quietly building a plan around one. Would accepting the client's address when we have nothing better have been simpler? Yes, and it would also undo the whole point of UPG2.
+
 `cargo test --lib upgrade::orchestrator`. Next: the operator's steering wheel — `relish upgrade`.
 
 ## 14.10 Driving it from relish
@@ -625,7 +658,7 @@ relish upgrade resume                  # carry on after a pause
 
 Notice what relish deliberately does **not** do: verify the signatures itself. It could — it embeds the same release keys — but the nodes *must* verify regardless (relish is outside their trust boundary), and a relish-side check would give integration tests signed with throwaway keys a false failure. One verification, in the place that matters.
 
-relish still assembles a node list for the start request, but it's no longer the source of truth. The leader rebuilds each node's API address from its own gossip membership table (which already carries the API port, derived once from the gossip port by a fixed offset) and its role from the Raft voter set, then validates relish's list against that. So a stale or hand-edited list can't upgrade a node under a false identity — the leader corrects what it safely can and rejects what it can't (see "What the API gained"). relish's job shrinks to *which* nodes and *how many workers at once*; the leader owns *what those nodes are*.
+relish still assembles a node list for the start request, but it's no longer the source of truth. The leader rebuilds each node's API address from its own gossip membership table (the address each node advertised over gossip, never a port-offset guess) and its role from the Raft voter set, then validates relish's list against that. So a stale or hand-edited list can't upgrade a node under a false identity — the leader corrects what it safely can and rejects what it can't (see "What the API gained"). relish's job shrinks to *which* nodes and *how many workers at once*; the leader owns *what those nodes are*.
 
 `plan` and `status` are the legibility half. Both are pure functions from data to a string, which makes them perfect **snapshot test** material — `insta::assert_snapshot!(render_plan("v0.2.0", 5, 2, 1, 2))` stores the rendered output in a `.snap` file under version control, and any change to the wording shows up as a reviewable diff instead of a broken `assert_eq` on a multi-line string literal. (First time we've used insta in this book: the workflow is run the test, eyeball the generated `.snap.new`, accept it. The eyeballing is the point — an earlier draft's single-node plan promised a "leadership transfer" with nobody to transfer to, and the snapshot diff caught it.)
 
@@ -789,3 +822,137 @@ fn authorize_cluster_admin(
 ```
 
 The `?` after the first call returns its error response early, so the function reads as the two rules it enforces, in order. The service token still passes, which matters: it's what the orchestrator presents when it directs each node. A unit test posts to all six routes with a scoped Admin and expects 403, another checks an unscoped Admin gets through, and a source-scanning test in `bun::authz` fails if any of those handlers stops calling the helper.
+
+## A pause with no way out
+
+The V02 soak found the next hole on its first night. The harness ran `relish upgrade start --binary …` against a cluster whose nodes had no `upgrades.external_signing_key`. The leader accepted the plan and recorded it in Raft. Then the first node refused its directive with a 409, "network upgrades require upgrades.external_signing_key in node.toml", and the run paused, exactly as §14.9 says it should.
+
+It stayed paused for twelve hours. `resume` would only repeat the refusal. Every later `relish upgrade start` got "an upgrade is already in progress", and so did `relish upgrade rollback v0.1.0`, because both handlers refused to touch the active slot while anything sat in it. The pause that was meant to hand control back to the operator had taken it away. Nothing but hand-editing Raft state could clear it.
+
+Two changes fix it, one on each side of the pause.
+
+### Don't record a run the nodes will refuse
+
+Every cluster directive fetches the binary from Pickle, so every node treats it as a network upgrade and demands the operator's external signature and a key to check it with. The leader can know that before it writes anything. `/v1/version` now reports `accepts_network_upgrades` (true when the node has an external key), the start handler reads it in the same probe that already fetches each node's version and digest, and a pure gate in `upgrade::plan` decides:
+
+```rust
+pub fn check_network_prerequisites(
+    external_signature: Option<&str>,
+    nodes: &[NetworkReadiness],
+) -> Result<(), UpgradeError> {
+    if external_signature.is_none_or(str::is_empty) {
+        return Err(UpgradeError::ExternalSignatureRequired);
+    }
+    let unready: Vec<&str> = nodes
+        .iter()
+        .filter(|node| node.accepts_network_upgrades == Some(false))
+        .map(|node| node.node.as_str())
+        .collect();
+    ...
+}
+```
+
+`Option::is_none_or` is true for `None`, and otherwise asks the closure about the value inside, so one call covers "no signature" and "an empty one". `str::is_empty` is passed as a function rather than written as a closure: any function with the right signature works where a closure is expected. `accepts_network_upgrades` is a plain `bool`. Our first draft made it an `Option<bool>` so a node too old to report it wouldn't block a start, but there are no older nodes: every 0.1.0 binary reports the field, and we don't carry compatibility shims for development builds. So the probe reads a missing field as `false` (`value["accepts_network_upgrades"].as_bool().unwrap_or(false)`), and a node with no upgrade manager at all says `false` outright. A node that can't tell us it will accept is a node we don't record a run for.
+
+The probe used to return one `Vec`. It now builds a pair per node and splits them with `Iterator::unzip`, which turns an iterator of `(A, B)` into an `(Vec<A>, Vec<B>)` in one pass. So a start that would have paused on its first node now fails straight away with "node n1 cannot accept a cluster upgrade: set upgrades.external_signing_key in node.toml on every node first", and nothing reaches Raft.
+
+### A way out of a pause
+
+A pre-check can't catch everything. A node can still refuse for its own reasons, or crash-loop and revert. So the pause needs exits, and there are now three:
+
+- `relish upgrade resume` retries, as before.
+- `relish upgrade abort` (new, `POST /v1/upgrade/abort`) ends the run and leaves every node where it is.
+- `relish upgrade rollback <version>` now *replaces* a paused run instead of being refused by it.
+
+Abort is only safe when no node moved. `orchestrator::abort` is another pure function over the replicated state. It refuses a run that isn't `Paused`, and it refuses one where any node is `Healthy` (on the target), `Directed` or `Verifying` (told to swap, and maybe still swapping). Dropping the plan then would leave those nodes on a different version with nothing tracking them. The refusal names them and points at `rollback`. Failed, rolled-back and never-directed nodes are all on their old binary, so for everything else, abort really is "as if we never started".
+
+A rollback doesn't need that condition, because it walks every node to its own target, moved or not. Its handler now asks `orchestrator::supersede` whether the active run may be replaced (only a paused one may) and archives it before recording the rollback. The archive happens *after* the rollback plan has been validated, so a malformed request leaves the paused run where it was.
+
+Both paths end the old run the same way. We added a phase:
+
+```rust
+pub enum ClusterUpgradePhase {
+    // ...
+    Paused { reason: String },
+    Aborted { reason: String },
+}
+```
+
+It goes last for the reason the `RaftRequest` comment spells out: the Raft log is bincode, which writes an enum variant as its index, so inserting a variant in the middle would make every stored entry after it decode as its neighbour. The handler writes the run with its `Aborted` phase, then clears it into history, so `relish upgrade status` shows what happened to it instead of a bare "paused". Those are two Raft writes. If the leader dies between them, the orchestrator loop finds an `Aborted` run in the active slot and archives it on its next tick, the same recovery it already had for `Completed`.
+
+Two small things changed on the way. The 409 for a start or rollback against a paused run now names the run and all three exits rather than "an upgrade is already in progress". And `abort` goes through `authorize_cluster_admin` like every other upgrade route, which the source-scanning test in `bun::authz` now checks too.
+
+The tests follow the layers. `plan::tests` covers the gate (no signature, empty signature, nodes that refuse), and `orchestrator::tests` checks that a `/v1/version` without the field probes as "can't accept". The same module covers abort on a clean pause, refusal for each of the three "moved" phases, refusal when not paused, supersede over a node that did move, and a `step` that leaves an aborted run alone. The cluster suite gets two real-binary tests. `start_refuses_when_a_node_cannot_verify_network_upgrades` boots two nodes, one without an external key, and checks that `relish upgrade start` fails naming that node with nothing recorded. `paused_upgrade_can_be_aborted_or_replaced_by_a_rollback` poisons a worker's binary so the run pauses, aborts it through relish, starts again (accepted, now that the slot is free), lets it pause a second time, and replaces that one with `relish upgrade rollback v0.1.0`, which completes.
+
+Running the whole upgrade suite twice in a row turned up a leak of our own. A single-node test deploys a workload on a fixed port, and workloads run under detached process owners precisely so they survive Bun's `exec`. They survived the test too. The next run found port 46071 already serving and its own instance never appeared. The harness now kills every process whose command line names its temporary directory, both in `shutdown` and in a `Drop` implementation. `Drop` is Rust's destructor: the compiler calls `drop(&mut self)` when a value goes out of scope, including while a panic unwinds the stack, so a failed assertion can't skip the cleanup the way it skips a `shutdown().await` at the end of the test.
+
+## One blip is not a refusal
+
+The V02 soak's next finding came from a chaos step, not a misconfiguration. Mid-walk, the harness SIGKILLed the leader's Bun. Node 3 had already upgraded. systemd brought the leader back three seconds later, and within the same second its orchestrator (the state lives in Raft, so the restart is just a resume) sent node 2 its directive. Node 2 asked the leader's Pickle registry for the binary. The registry wasn't listening yet: in the journal, "Pickle registry listening" comes eight lines *after* the pause. The fetch failed with "error sending request", node 2 answered 409 like any other refusal, and the orchestrator did what §14.9 told it to on a refusal. It paused. Ten minutes later the harness gave up and rolled back.
+
+Nothing was wrong with the binary, the signatures or node 2. The registry was simply three seconds late. So the question is: which failures mean "no", and which mean "not right now"?
+
+### Two kinds of failure, in the types
+
+"No" is anything that will give the same answer next time: a hash or signature that doesn't verify, a missing external key, a version the policy refuses, a registry that answers 404 because it doesn't hold the blob. "Not right now" is anything about reachability: a connection refused or reset, a body cut off halfway, a 5xx, a 408 or a 429. One helper, `upgrade::is_transient_status`, draws that line for HTTP statuses, and both sides of the directive use it.
+
+On the node, `fetch_binary` used to return `FetchFailed` for everything. It now has a sibling variant, `FetchUnavailable`, and `UpgradeError::is_transient()` is a one-line `matches!` over it. The node rides out an unavailable source itself for a short budget (10 s, backing off from 500 ms), because the fetch runs while the agent holds its command loop and the orchestrator is waiting on the HTTP answer. If the source is still down after that, the API answers **503** instead of 409.
+
+Holding the command loop also means a registry that *accepts* the connection and then says nothing is worse than one that refuses it. reqwest has no timeout by default, so the first version of the retry would have waited on that registry forever, with the whole agent stuck behind it. Each attempt now runs under `tokio::time::timeout`: 5 s to connect and get the response headers, 60 s for the whole attempt, body included (plenty for a ~100 MB binary on a LAN), and 75 s for the whole fetch, retries and backoff included. `timeout` wraps any future and returns `Err(Elapsed)` if the deadline passes first, dropping the inner future. In Rust, dropping a future cancels it, so the half-read connection is closed as well. A timeout counts as `FetchUnavailable`, because a registry that hangs is still a "not right now". A guard on a match arm does it:
+
+```rust
+Ok(Err(crate::bun::BunError::Upgrade(error))) if error.is_transient() => (
+    StatusCode::SERVICE_UNAVAILABLE,
+    Json(serde_json::json!({ "error": error.to_string() })),
+)
+    .into_response(),
+Ok(Err(e)) => (StatusCode::CONFLICT, /* … */).into_response(),
+```
+
+The `if` after the pattern is a *match guard*: the arm only matches when the pattern fits *and* the condition holds, otherwise matching falls through to the next arm. Order matters, so the more specific arm goes first.
+
+On the leader, `NodeControl::direct_upgrade` used to return `Result<(), String>`. A `String` can't tell you whether to retry without someone parsing it, which is exactly the stringly-typed API the project guide warns about. It now returns a two-variant error:
+
+```rust
+pub enum DirectiveError {
+    Transient(String),
+    Refused(String),
+}
+```
+
+A Go programmer would reach for a sentinel error and `errors.Is`. The Rust version is stronger in one specific way: the orchestrator `match`es on the result, and the compiler refuses to build it until both variants have an arm. Nobody can add a third kind of failure later and forget to decide what the walk does with it. A failure to reach the node at all is `Transient` too, since a node that is itself restarting looks just like that.
+
+### Retrying without losing your place
+
+A transient failure leaves the node `Pending` and fills in a new `directive_retry` field on its record: attempts so far, when the first one failed, when the last one did, and what it said. Because that record lives in Raft, a leader that changes mid-retry carries on with the same count and the same window rather than starting over. The orchestrator re-sends when the backoff has passed (3 s, doubling, capped at 30 s) and gives up after `DIRECTIVE_RETRY_WINDOW`, two minutes from the first failure. Only then does the node go `Failed`, with a reason that says how long it tried, and the run pauses as before. A refusal skips all of that and pauses on the spot.
+
+The subtle part is the concurrency budget. A council member waiting out its backoff still *holds its slot*. If it didn't, the next tick would see a free slot and direct the next council member, and the walk would quietly reorder itself around a node that is owed its turn. So pass 2 takes the slot before it even looks at the backoff:
+
+```rust
+slots -= 1;
+if record
+    .directive_retry
+    .as_ref()
+    .is_some_and(|retry| !retry_due(retry, context.now))
+{
+    continue;
+}
+```
+
+`as_ref()` turns an `&Option<DirectiveRetry>` into an `Option<&DirectiveRetry>`, so we can look inside without moving the value out of the record, and `is_some_and` is `false` for `None` and the closure's answer for `Some`. Writing this turned up an older bug in the same loop. A refused directive marked the node `Failed` but didn't use up its slot, so with `parallel = 2` the loop went on to direct the *next* worker in the same tick, past the failure that was about to pause the run. A refusal now ends pass 2, the same rule pass 1 already applied.
+
+`set_phase` clears `directive_retry` on every transition out of `Pending`, and `resume` clears it too, so a resumed run gets a fresh two minutes. The new field changes what the Raft log stores, and the 503 changes what a directive can answer, so `compatibility::CURRENT` moved to protocol 27 and state 43.
+
+### What we decided not to do
+
+We thought about letting a node fetch the blob from *any* Pickle node rather than the one address in the directive. It would have dodged this particular outage. It isn't simple, though. `relish upgrade start` pushes the binary to one registry, and nothing guarantees the other nodes hold that raw blob by the time the walk reaches them. A node would also need a list of peer registries it doesn't have today. The retry fixes the failure we actually saw, a registry that is late, and a registry that is *gone* is still a pause the operator should see.
+
+We also didn't make the orchestrator wait for its own registry after a restart. The registry in the directive needn't be the leader's, and a retry covers that case and every other kind of blip with one mechanism.
+
+### Tests
+
+`orchestrator::tests` scripts the mock node's answers. `transient_directive_failure_keeps_the_node_pending_and_retries` walks the clock through two transient failures, checks that no attempt happens inside a backoff and that the third one succeeds. `transient_failures_past_the_retry_window_pause_the_run` ticks every three seconds for two minutes (between four and ten attempts, never paused) and then checks the pause names the last error. `refused_directive_pauses_at_once_and_starts_no_sibling` pins the refusal path, including the sibling bug. `a_node_retrying_holds_its_place_in_the_rolling_order` checks the slot. Three more point the real `HttpNodeControl` at a canned 503, a canned 409 and a closed port.
+
+In `manager::tests`, `flaky_registry` is a tiny TCP server that follows a script (hang up, answer a status, or serve the blob) and counts requests. `prepare_rides_out_a_registry_that_is_briefly_unavailable` gets a hang-up, then a 503, then the blob, and stages it on the third request. A 404 fails after exactly one request and isn't transient. A registry that never comes back is reported transient with nothing staged. So is one that accepts and never answers, or stalls halfway through the body, and `a_hanging_registry_is_a_transient_failure_within_the_ceiling` checks that it gives up within the ceiling instead of hanging. Finally, and bytes that don't verify aren't transient even though they came over the network. An API test checks the 503/409 split end to end.
+
+The cluster suite gets `a_registry_outage_at_directive_time_does_not_pause_the_upgrade`. It puts a TCP proxy in front of the leader's registry that hangs up on everything for the first 25 seconds, longer than a node's own 10 s budget, so the orchestrator has to re-send. It points the upgrade at the proxy and requires the run to reach `Completed` with every node on v0.2.0, and requires that the outage actually turned fetches away. Otherwise the test would prove nothing.

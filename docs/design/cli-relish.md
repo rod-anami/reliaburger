@@ -724,6 +724,7 @@ relish upgrade status               # Show upgrade progress
 relish upgrade rollback             # Roll back to previous version
 relish upgrade rollback <version>   # Roll back to specific version
 relish upgrade resume               # Resume a paused upgrade
+relish upgrade abort                # End a paused upgrade that moved no node
 
 # Fault injection (Smoker)
 relish fault delay <app> <duration> --acknowledge       # Reserved; rejected until TC ships
@@ -786,6 +787,7 @@ relish dev disk                             # Disk usage in the test VM
 relish dev clean                            # Clean build artefacts in the test VM
 relish dev keygen --out <dir>               # Generate a release signing keypair
 relish dev sign-binary --key <key> <binary> # Sign a binary (.sig envelope)
+relish dev countersign-binary --external-key <key> <binary>  # Add the operator signature
 
 # Manual, source, setup
 relish manual                               # Read the built-in manual (TUI)

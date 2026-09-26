@@ -102,6 +102,13 @@ where
 impl ClusterHarness {
     /// Boot `count` nodes: node 0 bootstraps, the rest join via gossip.
     async fn start(count: usize) -> Self {
+        Self::start_with_keyless(count, &[]).await
+    }
+
+    /// Boot `count` nodes, leaving `upgrades.external_signing_key` out of
+    /// the node.toml of the nodes whose index is in `keyless`. Those nodes
+    /// refuse every cluster (network) upgrade directive.
+    async fn start_with_keyless(count: usize, keyless: &[usize]) -> Self {
         let root = tempfile::tempdir().unwrap();
         // The registry deliberately caps each upload at 512 MiB. Debug symbols
         // can exceed that on CI; remove them from this private fixture only,
@@ -169,6 +176,14 @@ impl ClusterHarness {
                 seed_gossip = Some(gossip_port);
             }
 
+            let external_key_line = if keyless.contains(&index) {
+                String::new()
+            } else {
+                format!(
+                    "external_signing_key = \"{}\"",
+                    encode_public_key(&external_public)
+                )
+            };
             let config_path = node_root.join("node.toml");
             std::fs::write(
                 &config_path,
@@ -202,7 +217,7 @@ registry_port = {registry_port}
 
 [upgrades]
 binary_dir = "{bin}"
-external_signing_key = "{external}"
+{external_key_line}
 release_keys_override = ["{release}"]
 boot_grace_secs = 2
 gossip_rejoin_secs = 10
@@ -212,7 +227,6 @@ retain_versions = 3
                     node_root = node_root.display(),
                     master_key = master_key_path.display(),
                     bin = bin_dir.display(),
-                    external = encode_public_key(&external_public),
                     release = encode_public_key(&release_public),
                 ),
             )
@@ -347,28 +361,7 @@ retain_versions = 3
                     .cluster_state_from(node)
                     .await
                     .is_some_and(|state| state["active"].is_null());
-                let live_members = async {
-                    let response = self
-                        .client
-                        .get(format!("http://{}/v1/cluster/nodes", node.api))
-                        .send()
-                        .await
-                        .ok()?
-                        .error_for_status()
-                        .ok()?;
-                    response
-                        .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
-                        .await
-                        .ok()
-                }
-                .await;
-                let membership_ready = live_members.is_some_and(|members| {
-                    self.nodes.iter().all(|expected| {
-                        members.iter().any(|member| {
-                            member.node_id == expected.name && member.state == "alive"
-                        })
-                    })
-                });
+                let membership_ready = self.knows_every_member(node).await;
                 if leader_agrees && upgrade_idle && membership_ready {
                     return leader;
                 }
@@ -379,6 +372,40 @@ retain_versions = 3
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// Whether `node` sees every harness node alive AND has heard each one
+    /// advertise its API endpoint. An upgrade plan is validated against
+    /// exactly that view, and a leader that has just restarted learns its
+    /// peers from a membership sync before their own gossip arrives: until
+    /// then it would refuse the plan as "not advertised yet".
+    async fn knows_every_member(&self, node: &ClusterNode) -> bool {
+        let members = async {
+            let response = self
+                .client
+                .get(format!("http://{}/v1/cluster/nodes", node.api))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            response
+                .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
+                .await
+                .ok()
+        }
+        .await;
+        members.is_some_and(|members| {
+            self.nodes.iter().all(|expected| {
+                members.iter().any(|member| {
+                    member.node_id == expected.name
+                        && member.state == "alive"
+                        && member
+                            .api_address
+                            .is_some_and(|address| address.to_string() == expected.api)
+                })
+            })
+        })
     }
 
     async fn node_version(&self, api: &str) -> Option<String> {
@@ -423,7 +450,7 @@ retain_versions = 3
     }
 
     async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
-        let leader = self.wait_for_leader().await;
+        let leader = self.wait_for_idle_leader().await;
         let (list, worker) = self.plan_nodes_for(&leader);
         (list, leader, worker)
     }
@@ -431,8 +458,18 @@ retain_versions = 3
     /// Sign + push the v0.2.0 binary to the leader's registry, start the
     /// upgrade, return (upgrade_id, leader, worker).
     async fn start_upgrade(&self) -> (String, String, String) {
+        self.start_upgrade_fetching_from(None).await
+    }
+
+    /// [`Self::start_upgrade`], but tell the nodes to fetch the binary from
+    /// `registry` (a proxy in front of the leader's) when given.
+    async fn start_upgrade_fetching_from(
+        &self,
+        registry: Option<String>,
+    ) -> (String, String, String) {
         let (nodes, leader, worker) = self.plan_nodes().await;
         let leader_node = self.node(&leader);
+        let registry_address = registry.unwrap_or_else(|| leader_node.registry.clone());
 
         let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
         let sha256 = signing::sha256_hex(&bytes);
@@ -464,7 +501,7 @@ retain_versions = 3
             "embedded_signature": signing::sign(&self.release_pkcs8, &bytes).unwrap(),
             "external_signature": signing::sign(&self.external_pkcs8, &bytes).unwrap(),
             "parallel": 1,
-            "registry_address": leader_node.registry,
+            "registry_address": registry_address,
             "nodes": nodes,
         });
         let response = self
@@ -970,5 +1007,192 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
         "rollback incomplete: {versions:?}"
     );
 
+    harness.shutdown().await;
+}
+
+/// The V02 soak's dead end: a node without an external key refused every
+/// directive, the run paused, and the paused run blocked every later start.
+/// The leader now asks each node first and refuses the start outright.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn start_refuses_when_a_node_cannot_verify_network_upgrades() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start_with_keyless(2, &[1]).await;
+    let leader = harness.wait_for_idle_leader().await;
+    let leader_node = harness.node(&leader);
+    let client = harness.relish_client(leader_node);
+    let staging = tempfile::tempdir().unwrap();
+    let bytes = std::fs::read(leader_node.bin_dir.join("bun-v0.2.0")).unwrap();
+    let candidate = harness.signed_candidate(staging.path(), "v0.2.0", &bytes);
+
+    let err =
+        reliaburger::relish::upgrade::start(&client, ClusterHarness::start_args(candidate, false))
+            .await
+            .expect_err("a node without an external key must stop the start");
+    let message = err.to_string();
+    assert!(
+        message.contains("node n1") && message.contains("upgrades.external_signing_key"),
+        "unexpected refusal: {message}"
+    );
+    assert!(
+        harness.cluster_state().await.unwrap()["active"].is_null(),
+        "nothing may be recorded for a refused start"
+    );
+
+    harness.shutdown().await;
+}
+
+/// A paused run is no longer a dead end: `relish upgrade abort` ends one
+/// that moved no node, and `relish upgrade rollback` replaces one outright.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn paused_upgrade_can_be_aborted_or_replaced_by_a_rollback() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(4).await;
+
+    // Poison the worker's v0.2.0 so the first swap reverts and the run
+    // pauses with every node still on v0.1.0.
+    let (_, _, worker) = harness.plan_nodes().await;
+    std::fs::write(
+        harness.node(&worker).bin_dir.join("bun-v0.2.0.fail-boot"),
+        "",
+    )
+    .unwrap();
+    let (first_id, _, _) = harness.start_upgrade().await;
+    let (_, phase) = harness.watch_upgrade(&first_id, true).await;
+    assert!(phase.starts_with("Paused"), "expected a pause, got {phase}");
+    harness.wait_for_versions("v0.1.0").await;
+
+    // Abort: the paused run moves to history, marked Aborted.
+    let leader = harness.wait_for_leader().await;
+    let client = harness.relish_client(harness.node(&leader));
+    reliaburger::relish::upgrade::abort(&client)
+        .await
+        .expect("abort a paused run that moved no node");
+    let state = harness.cluster_state().await.unwrap();
+    assert!(state["active"].is_null(), "abort left {}", state["active"]);
+    let archived = state["history"]
+        .as_array()
+        .and_then(|history| history.last())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(archived["upgrade_id"], first_id);
+    assert_eq!(phase_label(&archived["phase"]), "Aborted");
+
+    // With the slot free, a new start is accepted (and pauses again on the
+    // still-poisoned worker)...
+    harness.wait_for_idle_leader().await;
+    let (second_id, _, _) = harness.start_upgrade().await;
+    assert_ne!(second_id, first_id);
+    let (_, phase) = harness.watch_upgrade(&second_id, true).await;
+    assert!(phase.starts_with("Paused"), "expected a pause, got {phase}");
+    harness.wait_for_versions("v0.1.0").await;
+
+    // ...and a cluster rollback replaces the paused run instead of being
+    // refused with "already in progress".
+    let leader = harness.wait_for_leader().await;
+    wait_for("the leader to know every node's API", WAIT, || async {
+        harness.knows_every_member(harness.node(&leader)).await
+    })
+    .await;
+    let client = harness.relish_client(harness.node(&leader));
+    reliaburger::relish::upgrade::rollback(&client, Some("v0.1.0".to_string()), Vec::new())
+        .await
+        .expect("rollback replaces a paused run");
+    wait_for("the rollback to finish", WAIT, || async {
+        harness.cluster_state().await.is_some_and(|state| {
+            state["active"].is_null()
+                && state["history"].as_array().is_some_and(|history| {
+                    history.iter().any(|entry| {
+                        entry["upgrade_id"] == second_id
+                            && phase_label(&entry["phase"]) == "Aborted"
+                    }) && history.last().is_some_and(|entry| {
+                        entry["upgrade_id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("rollback-v0.1.0"))
+                            && phase_label(&entry["phase"]) == "Completed"
+                    })
+                })
+        })
+    })
+    .await;
+    let versions = harness.wait_for_versions("v0.1.0").await;
+    assert_eq!(versions.len(), harness.nodes.len(), "{versions:?}");
+
+    harness.shutdown().await;
+}
+
+/// A TCP proxy to `upstream` that hangs up on every connection for the
+/// first `outage`, the way a registry looks while its bun restarts. Returns
+/// its address and how many connections it hung up on.
+async fn registry_with_outage(
+    upstream: String,
+    outage: Duration,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let hangups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hangups.clone();
+    let back_at = tokio::time::Instant::now() + outage;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = listener.accept().await else {
+                return;
+            };
+            if tokio::time::Instant::now() < back_at {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(inbound);
+                continue;
+            }
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (address, hangups)
+}
+
+/// V02 soak: a leader bun was SIGKILLed mid-walk, came back, and directed
+/// the next node before its own registry was listening. The node's binary
+/// fetch failed and that single blip paused the run. A registry that is
+/// down when the directive lands must be ridden out, not paused on.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
+async fn a_registry_outage_at_directive_time_does_not_pause_the_upgrade() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
+    let _serial = SERIAL.lock().await;
+    let harness = ClusterHarness::start(4).await;
+    let leader = harness.wait_for_idle_leader().await;
+
+    // Longer than a node's own fetch budget (10 s), so the node answers
+    // the first directive 503 and the orchestrator has to re-send it.
+    let (proxy, hangups) = registry_with_outage(
+        harness.node(&leader).registry.clone(),
+        Duration::from_secs(25),
+    )
+    .await;
+    let (upgrade_id, _, _) = harness.start_upgrade_fetching_from(Some(proxy)).await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, true).await;
+
+    assert_eq!(phase, "Completed", "the outage paused the upgrade");
+    assert!(
+        hangups.load(std::sync::atomic::Ordering::SeqCst) > 1,
+        "no fetch hit the outage, so the test proved nothing"
+    );
+    harness.wait_for_versions("v0.2.0").await;
     harness.shutdown().await;
 }

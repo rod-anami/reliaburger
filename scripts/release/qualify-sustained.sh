@@ -16,10 +16,18 @@
 #   --base-url URL          staged candidate directory (the staging pre-release)
 #   --qualified-digest SHA  require candidate.json to have this SHA-256
 #   --soak-bun PATH         signed soak build named bun-v0.1.0-soak.1 with PATH.sig
-#                           beside it; without it the upgrade slots are skipped
-#   --duration D            soak length: 40m, 24h, 2d (default 24h)
-#   --schedule S            full (hourly cycle) or compressed (10-minute cycle,
-#                           for dry runs); default full
+#                           (release signature) beside it; the harness adds the
+#                           operator signature to a copy (OpenSSL 3 needed);
+#                           without it the upgrade slots are skipped
+#   --tier T                fast (compressed schedule, 90m: the iteration loop
+#                           after each round of fixes) or final (full schedule,
+#                           8h: the acceptance run on the final candidate)
+#   --duration D            soak length: 40m, 8h, 2d (default: the tier's, or 24h)
+#   --schedule S            full (hourly cycle) or compressed (10-minute cycle);
+#                           default: the tier's, or full
+#                           An explicit --duration or --schedule overrides the
+#                           tier; a final tier shorter than 8h or not on the
+#                           full schedule never counts as acceptance
 #   --evidence DIR          evidence directory (default: a new
 #                           /var/tmp/reliaburger-v02.XXXXXX)
 #   --record FILE           where to write the record (default: in the evidence
@@ -47,8 +55,9 @@ podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
 qualified_digest=
 soak_bun=
-duration_text=24h
-schedule=full
+tier=
+duration_text=
+schedule=
 evidence=
 record=
 home=
@@ -59,6 +68,7 @@ while [ "$#" -gt 0 ]; do
         --base-url) base_url=${2:-}; shift 2 ;;
         --qualified-digest) qualified_digest=${2:-}; shift 2 ;;
         --soak-bun) soak_bun=${2:-}; shift 2 ;;
+        --tier) tier=${2:-}; shift 2 ;;
         --duration) duration_text=${2:-}; shift 2 ;;
         --schedule) schedule=${2:-}; shift 2 ;;
         --evidence) evidence=${2:-}; shift 2 ;;
@@ -71,19 +81,41 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# A resumed run keeps the tier, schedule and length it started with.
+if [ "$resume" = true ] && [ -f "${evidence:-.}/metadata.json" ]; then
+    started_with() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$evidence/metadata.json" "$1"; }
+    [ -n "$tier" ] || tier=$(started_with tier)
+    [ -n "$schedule" ] || schedule=$(started_with schedule)
+    [ -n "$duration_text" ] || { duration_text=$(started_with duration_target); duration_text=${duration_text:+$(( duration_text / 60 ))m}; }
+fi
+# The two tiers (plan D3): fast for the fix-and-rerun loop, final for acceptance.
+case $tier in
+    fast) : "${schedule:=compressed}" "${duration_text:=90m}" ;;
+    final) : "${schedule:=full}" "${duration_text:=8h}" ;;
+    ''|custom) tier=custom; : "${schedule:=full}" "${duration_text:=24h}" ;;
+    *) fail '--tier must be fast or final' ;;
+esac
+
 case $duration_text in
     *[0-9]m) duration=$(( ${duration_text%m} * 60 )) ;;
     *[0-9]h) duration=$(( ${duration_text%h} * 3600 )) ;;
     *[0-9]d) duration=$(( ${duration_text%d} * 86400 )) ;;
     *) fail '--duration must look like 40m, 24h or 2d' ;;
 esac
-# Schedule parameters: cycle length, power-off hold, TLS rotation period and
-# how often the catalogue pulse, offline export and registry push run.
+# Schedule parameters: cycle length, power-off hold, TLS rotation period, how
+# often the catalogue pulse, offline export and registry push run, and how many
+# chaos kinds each chaos slot runs. Two a slot lets an 8-hour full run (four
+# chaos slots with upgrade walks) reach all seven kinds. The run always
+# completes min_cycles cycles, even when faults overrun their slots: every
+# hour of a full run (so every special its length schedules), and cycles 0-3
+# of a compressed one, which carry every fault kind and every special.
 case $schedule in
     full) cycle=3600; hold_min=60; hold_max=180; rotation=900; kill_offset=20
-          quorum_hold=300; pulse_every=1; export_every=6; push_every=1 ;;
+          quorum_hold=300; pulse_every=1; export_every=6; push_every=1; chaos_per_slot=2
+          min_cycles=$(( duration / cycle )) ;;
     compressed) cycle=600; hold_min=20; hold_max=40; rotation=300; kill_offset=10
-          quorum_hold=60; pulse_every=0; export_every=2; push_every=1 ;;
+          quorum_hold=60; pulse_every=0; export_every=2; push_every=1; chaos_per_slot=2
+          min_cycles=4 ;;
     *) fail '--schedule must be full or compressed' ;;
 esac
 slot=$(( cycle / 6 ))
@@ -160,6 +192,41 @@ meta_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get
 
 # Kill a command that outlives its budget (macOS has no timeout(1)).
 with_timeout() { perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' "$@"; }
+
+# --- the operator signature -----------------------------------------------------
+
+# Network upgrades, and a cluster's `upgrade start --binary` is one (the nodes
+# fetch it from the registry), need a second signature from the operator's key
+# in [upgrades] external_signing_key. The soak plays the operator: a throwaway
+# Ed25519 key, kept in the evidence so --resume reuses it, and a copy of the
+# soak build's envelope with that key's signature added. The release signature
+# is copied as it is; the release key is never needed. openssl rather than
+# `relish dev countersign-binary`, so it works whatever relish the candidate has.
+operator_public=
+soak_sig=
+countersign_soak_bun() {
+    local key=$evidence/config/operator.key signature
+    if [ ! -f "$key" ]; then
+        [ "$resume" = false ] || fail '--soak-bun on --resume needs a run that started with --soak-bun'
+        (umask 077 && openssl genpkey -algorithm ed25519 -outform DER -out "$key" 2>/dev/null) \
+            || fail 'openssl cannot make an Ed25519 key (OpenSSL 3 is needed, not LibreSSL)'
+    fi
+    operator_public="ed25519:$(openssl pkey -inform DER -in "$key" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+    signature=$(openssl pkeyutl -sign -inkey "$key" -keyform DER -rawin -in "$soak_bun" | base64 | tr -d '\n') \
+        || fail 'openssl cannot sign with Ed25519 (OpenSSL 3 is needed, not LibreSSL)'
+    mkdir -p "$evidence/upgrade"
+    soak_sig=$evidence/upgrade/${soak_bun##*/}.sig
+    python3 - "$soak_bun.sig" "$soak_sig" "$(sha256 "$soak_bun")" "$signature" <<'PY' || fail "$soak_bun.sig does not belong to $soak_bun"
+import json, sys
+source, target, digest, signature = sys.argv[1:]
+envelope = json.load(open(source))
+if envelope.get("sha256", "").lower() != digest or not envelope.get("embedded"):
+    sys.exit(1)
+envelope["external"] = signature
+json.dump(envelope, open(target, "w"), indent=2)
+PY
+}
+[ -z "$soak_bun" ] || countersign_soak_bun
 
 # --- the cluster --------------------------------------------------------------
 
@@ -446,6 +513,9 @@ configure_nodes() {
     meta deviations+ 'node.toml `[logs]`/`[metrics]` export to file:///var/lib/reliaburger/soak-export every 60 s with max_storage_mb = 8, `[storage.snapshots]` every 900 s (compressed: 120 s), retain 4, uploaded to the same directory'
     meta deviations+ 'node.toml `[ingress] tls_cert/tls_key` point at an operator pair from a soak CA, 45-minute leaves rotated by the harness'
     meta deviations+ 'node.toml `[node.labels] soak-volume` = "writer" on node 2 and "redis" on node 3, to pin the volume apps'
+    if [ -n "$operator_public" ]; then
+        meta deviations+ "node.toml \`[upgrades] external_signing_key\` = a throwaway operator key the harness made for this run (\`$operator_public\`); the soak build's \`.sig\` gets that key's external signature beside the release one (D2)"
+    fi
     if [ "$leaf_supported" = yes ]; then
         meta deviations+ "node.toml \`[security] leaf_lifetime_override_secs = $leaf_lifetime\` (D1)"
         meta leaf_lifetime_secs "json:$leaf_lifetime"
@@ -472,6 +542,7 @@ configure_nodes() {
         )
         [ -z "$label" ] || settings+=("node.labels.soak-volume=\"$label\"")
         [ "$leaf_supported" != yes ] || settings+=("security.leaf_lifetime_override_secs=$leaf_lifetime")
+        [ -z "$operator_public" ] || settings+=("upgrades.external_signing_key=\"$operator_public\"")
         check toml-set "$evidence/config/node-$node.soak.toml" "${settings[@]}"
         push_pair "$node" "$tls/current/cert.pem" "$tls/current/key.pem"
         gsh_in "$node" < <(printf 'set -e\numask 077\nmkdir -p /var/lib/reliaburger/soak-export\ncat > /etc/reliaburger/node.toml.new <<"TOML"\n%s\nTOML\nmv /etc/reliaburger/node.toml.new /etc/reliaburger/node.toml\n' "$(cat "$evidence/config/node-$node.soak.toml")")
@@ -827,6 +898,7 @@ power_offs=0
 power_off() {
     local node=$1
     down[node]=1
+    check power-cut "$evidence"
     "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
 }
 power_on() {
@@ -853,9 +925,28 @@ slot_power_off() {
     settle fault:power-off 480 || true
 }
 
+# Every chaos kind against the rails: kill and pause meet the replica minimum,
+# so they aim at the three-replica frontend, one replica at a time; delay,
+# drop, partition and dns are network faults, which no replica rail guards;
+# the scenario runs its own checks.
+# Print one running instance of APP, or nothing unless at least two run.
+one_of_several() {
+    rel --output json status > "$evidence/.chaos-status.json" 2>/dev/null || return 0
+    python3 - "$evidence/.chaos-status.json" "$1" <<'PY'
+import json, sys
+ids = sorted(i["id"] for i in json.load(open(sys.argv[1])) if i["app_name"] == sys.argv[2] and i["state"] == "running")
+print(ids[0] if len(ids) >= 2 else "")
+PY
+}
+
 chaos_index=0
 slot_chaos() {
-    local kinds=(kill delay partition scenario pause drop dns) kind result=0 output=$evidence/snapshots/chaos-$chaos_index.log
+    local round
+    for (( round = 0; round < chaos_per_slot; round++ )); do chaos_one; done
+}
+
+chaos_one() {
+    local kinds=(kill delay partition scenario pause drop dns) kind instance result=0 output=$evidence/snapshots/chaos-$chaos_index.log
     kind=${kinds[chaos_index % ${#kinds[@]}]}
     chaos_index=$(( chaos_index + 1 ))
     say "fault: chaos $kind"
@@ -865,7 +956,15 @@ slot_chaos() {
         kill) rel fault kill frontend --count 1 --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         delay) rel fault delay frontend 200ms --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         partition) rel fault partition soak-redis --from soak-redis-client --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
-        pause) rel fault pause soak-spammer --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
+        # One frontend instance: the replica-minimum rail counts an unscoped
+        # pause as freezing every replica, and refuses it whatever the count.
+        pause)
+            instance=$(one_of_several frontend)
+            if [ -n "$instance" ]; then
+                rel fault pause frontend --instance "$instance" --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$?
+            else
+                printf 'fewer than two running frontend instances to pause one of\n' > "$output"; result=1
+            fi ;;
         drop) rel fault drop frontend 10% --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         dns) rel fault dns soak-redis nxdomain --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         scenario)
@@ -972,12 +1071,16 @@ slot_upgrade() {
     name=${soak_bun##*/}
     target=${name#bun-v}
     inject=$(( upgrade_walks % 2 ))
+    # Compressed runs see two walks at most, so both carry a fault: a leader
+    # SIGKILL on the first and a follower power-off on the second.
+    [ "$schedule" = full ] || inject=1
     say "upgrade walk $upgrade_walks to $target$([ "$inject" -eq 1 ] && echo ', with a fault mid-walk')"
     open_window upgrade
-    with_timeout 300 "$limactl" copy "$soak_bun" "$soak_bun.sig" "${vm[1]}:/var/tmp/" > /dev/null
+    # The countersigned envelope, under the name upgrade start looks for.
+    with_timeout 300 "$limactl" copy "$soak_bun" "$soak_sig" "${vm[1]}:/var/tmp/" > /dev/null
     gsh 1 "install -m 600 /dev/null /root/.soak-token && cat > /root/.soak-token" < "$evidence/.token"
     started=$(date +%s)
-    gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050" \
+    gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade start --binary /var/tmp/$name --registry ${address[1]}:5050 --allow-downgrade" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-start.log" 2>&1 || record_failure upgrade "upgrade start failed; see upgrade-$upgrade_walks-start.log"
     if [ "$inject" -eq 1 ]; then
         sleep "$(random_between 10 60)"
@@ -985,13 +1088,31 @@ slot_upgrade() {
             local node; node=$(random_between 2 3); power_off "$node"; sleep "$hold_min"; power_on "$node" || true
         fi
     fi
-    wait_versions "$target" 600 "$started" upgrade || true
+    # Every node reporting the target isn't the end of the run: the leader
+    # marks it Completed on a later tick, and a rollback before that is
+    # refused as "already in progress". A paused run needs no wait, since
+    # rollback replaces it.
+    if wait_versions "$target" 600 "$started" upgrade; then wait_upgrade_idle 120 || true; fi
     started=$(date +%s)
     gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade rollback v0.1.0" \
         > "$evidence/snapshots/upgrade-$upgrade_walks-rollback.log" 2>&1 || record_failure upgrade "upgrade rollback failed"
     wait_versions 0.1.0 600 "$started" rollback || true
     settle upgrade:settle 600 || true
     return 0
+}
+
+wait_upgrade_idle() {
+    local budget=$1 started status
+    started=$(date +%s)
+    while :; do
+        status=$(gsh 1 "RELIABURGER_TOKEN=\$(cat /root/.soak-token) relish --endpoint https://127.0.0.1:9117 --ca-cert /etc/reliaburger/identity/root-ca.crt upgrade status" 2>&1 || true)
+        case $status in *[Nn]'o upgrade in progress'*) return 0 ;; esac
+        if [ $(( $(date +%s) - started )) -ge "$budget" ]; then
+            record_failure upgrade-complete "run still in progress $budget s after every node reported the target: $(printf '%s' "$status" | head -n 3 | tr '\n' ' ')"
+            return 1
+        fi
+        sleep 5
+    done
 }
 
 wait_versions() {
@@ -1057,6 +1178,10 @@ run_cycle() {
     current_slot="$index:leader-kill"; wait_until $(( start + slot )); run_slot slot_bun_kill leader
     if [ $(( index % 2 )) -eq 1 ] && [ -n "$soak_bun" ]; then
         current_slot="$index:upgrade"; wait_until $(( start + 2 * slot )); run_slot slot_upgrade
+        # Compressed runs chaos after the walk too, so cycles 0-3 cover all seven kinds.
+        if [ "$schedule" = compressed ]; then
+            current_slot="$index:chaos"; wait_until $(( start + 4 * slot )); run_slot slot_chaos
+        fi
     else
         [ $(( index % 2 )) -eq 0 ] || event --phase upgrade --verdict skipped --detail 'no --soak-bun'
         current_slot="$index:deploy-kill"; wait_until $(( start + 2 * slot )); run_slot slot_deploy_kill
@@ -1079,9 +1204,10 @@ run_cycle() {
 }
 
 # Specials scale with the run: graceful stop/start at each half, quorum loss
-# at 40% and 85% of the hours, every VM off at 70%. A 12 h run gets graceful
-# at 6 and 12, quorum loss at 5 and 10, all off at 8.
+# at 40% and 85% of the hours, every VM off at 70%. An 8 h final-tier run gets
+# graceful at 4 and 8, quorum loss at 3 and 7, all off at 6.
 # The compressed schedule runs one of each on cycles 1-3 instead.
+# min_cycles makes sure every scheduled one gets its cycle.
 special_for_cycle() {
     local index=$1 hour
     if [ "$schedule" = compressed ]; then
@@ -1149,6 +1275,7 @@ finish() {
 # --- main ------------------------------------------------------------------------
 
 start_run() {
+    meta tier "$tier"
     meta schedule "$schedule"
     meta evidence "\`$evidence\`"
     meta started_at "json:$(date +%s)"
@@ -1164,7 +1291,8 @@ start_run() {
     if [ "$(uname -s)" = Darwin ]; then
         meta host "macOS $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
     else
-        meta host "$(uname -srm)"
+        # shellcheck source=/dev/null
+        meta host "$(. /etc/os-release && printf '%s' "$PRETTY_NAME"), $(uname -srm), $(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo), $(nproc) CPUs, $(awk '/^MemTotal/ {print int($2 / 1048576); exit}' /proc/meminfo) GiB"
     fi
 }
 
@@ -1182,6 +1310,9 @@ if [ "$resume" = true ]; then
     last_event=$(tail -n 1 "$evidence/events.jsonl" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ts"])')
     gap=$(( $(date +%s) - last_event ))
     event --phase pause --duration "$gap" --detail 'resumed after an interruption'
+    # Carry on the chaos rotation and the walk count where the run left off.
+    chaos_index=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase", "").startswith("fault:chaos-") and "exit" in e))' "$evidence/events.jsonl")
+    upgrade_walks=$(python3 -c 'import json,sys; print(sum(1 for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "upgrade:upgrade"))' "$evidence/events.jsonl")
     ingress_rotations=$(find "$tls" -maxdepth 1 -name 'leaf-*' | wc -l | tr -d ' ')
     say "resuming at cycle $first_cycle after a $gap s gap"
     paused=$(python3 -c 'import json,sys; print(sum(e.get("duration", 0) for e in map(json.loads, open(sys.argv[1])) if e.get("phase") == "pause"))' "$evidence/events.jsonl")
@@ -1229,8 +1360,9 @@ next_heavy=$(( $(date +%s) + heavy_every ))
 index=$first_cycle
 while :; do
     cycle_start=$(( started_at + index * cycle ))
-    # A cycle that starts finishes; none starts once the soak time is up.
-    if [ "$cycle_start" -ge "$end" ] || [ "$(date +%s)" -ge "$end" ]; then break; fi
+    # A cycle that starts finishes; none starts once the soak time is up,
+    # unless the run hasn't yet reached min_cycles.
+    if [ "$index" -ge "$min_cycles" ] && { [ "$cycle_start" -ge "$end" ] || [ "$(date +%s)" -ge "$end" ]; }; then break; fi
     [ "$cycle_start" -ge "$(date +%s)" ] || cycle_start=$(date +%s)
     run_cycle "$index" "$cycle_start"
     index=$(( index + 1 ))

@@ -89,12 +89,66 @@ class WriterAndRedis(Evidence):
     def test_redis_counter_going_backwards_within_one_tail_fails(self):
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\nINCR 1\nINCR 2\n"}))
         self.assertEqual(code, 1)
-        self.assertIn("redis-counter", self.failures(verdict))
+        self.assertIn("redis-log-order", self.failures(verdict))
 
     def test_redis_counter_below_an_earlier_tail_fails(self):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "ERR Could not connect\nINCR 3\nINCR 4\n"}))
-        self.assertIn("redis-counter", self.failures(verdict))
+        self.assertIn("redis-log-order", self.failures(verdict))
+
+    def test_writer_log_going_backwards_is_a_log_order_failure_not_data_loss(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\nACK 11\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 12\nACK 9\nACK 13\n",
+                                                        "writer__file_txt": "LAST 13\n"}))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-log-order"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-log-order")
+        self.assertIn("log view", detail)
+        self.assertIn("writer file", detail)
+
+    def test_log_order_findings_never_claim_data_loss(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\n", "writer__log_txt": "ACK 10\n"}))
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 3\nINCR 2\n", "writer__log_txt": "ACK 5\nACK 4\n"}))
+        details = [item["detail"] for item in verdict["findings"] if item["check"].endswith("-log-order")]
+        self.assertEqual(len(details), 4)
+        for detail in details:
+            self.assertTrue(detail.startswith("log view"), detail)
+            self.assertNotIn("acknowledged", detail)
+
+    def power_cut(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["power-cut", str(self.evidence)])
+
+    def test_a_tail_ending_lower_after_a_power_cut_is_info_once(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40639\nACK 40640\n",
+                                        "redis__log_txt": "INCR 2503\nINCR 2504\n"}))
+        self.power_cut()
+        code, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40313\nACK 40314\n",
+                                                        "redis__log_txt": "INCR 781\nINCR 782\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        excused = [item for item in verdict["findings"] if item["check"].endswith("-log-order")]
+        self.assertEqual({item["severity"] for item in excused}, {"info"})
+        self.assertTrue(all("power cut" in item["detail"] for item in excused))
+        # The baseline restarts from the lower tail; the next tail only has to rise.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40641\n", "redis__log_txt": "INCR 2600\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # Once the tails have advanced outside a window the excuse is spent.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\n"}))
+        self.assertIn("writer-log-order", self.failures(verdict))
+
+    def test_a_power_cut_never_lowers_what_the_writer_file_must_hold(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40640\n"}))
+        self.power_cut()
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 40314\n"}))
+        code, verdict = self.evaluate(self.snapshot(**{"writer__file_txt": "LAST 40314\n"}))
+        self.assertEqual(code, 1)
+        self.assertIn("writer-regression", self.failures(verdict))
+
+    def test_lines_going_backwards_within_one_tail_still_fail_after_a_power_cut(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
+        self.power_cut()
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 50\nINCR 45\n"}))
+        self.assertIn("redis-log-order", self.failures(verdict))
 
     def test_redis_errors_during_an_outage_do_not_fail(self):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
@@ -237,6 +291,80 @@ class Exports(Evidence):
         self.assertEqual(self.failures(verdict), ["snapshot-missing"])
 
 
+class Registry(Evidence):
+    """Pickle refuses tag reads without a leader; that's not the same as losing an image."""
+
+    MANIFEST = b'{"schemaVersion": 2}'
+    BLOB = b"layer"
+
+    def push_state(self):
+        state = checker.load_state(self.evidence)
+        state["registry_pushed"] = [{"tag": "baseline",
+                                     "manifest": "sha256:" + checker.hashlib.sha256(self.MANIFEST).hexdigest(),
+                                     "blobs": ["sha256:" + checker.hashlib.sha256(self.BLOB).hexdigest()]}]
+        checker.save_state(self.evidence, state)
+
+    def verify(self, manifest_answers):
+        """Run `registry verify` against canned answers for the manifest GETs."""
+        self.push_state()
+        answers = list(manifest_answers)
+        calls = []
+
+        def request(args, method, path, body=None, headers=None):
+            calls.append(path)
+            if "/manifests/" in path:
+                status, body = answers.pop(0)
+                return status, {}, body
+            return 200, {}, self.BLOB
+
+        args = type("Args", (), {"evidence": self.evidence, "action": "verify"})()
+        original, sleep = checker.registry_request, checker.time.sleep
+        checker.registry_request, checker.time.sleep = request, lambda _: None
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                checker.registry_command(args)
+        finally:
+            checker.registry_request, checker.time.sleep = original, sleep
+        return json.loads(out.getvalue()), calls
+
+    def test_a_brief_503_is_retried_and_not_reported(self):
+        result, calls = self.verify([(503, b""), (200, self.MANIFEST)])
+        self.assertEqual((result["problems"], result["unavailable"]), ([], []))
+        self.assertEqual(sum("/manifests/" in path for path in calls), 2)
+
+    def test_a_lasting_503_is_unavailable_not_a_problem(self):
+        result, calls = self.verify([(503, b"")] * checker.REGISTRY_UNAVAILABLE_TRIES)
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(len(result["unavailable"]), 1)
+        self.assertEqual(sum("/manifests/" in path for path in calls), checker.REGISTRY_UNAVAILABLE_TRIES)
+
+    def test_changed_or_missing_bytes_are_problems_at_once(self):
+        for answer, words in (((200, b"other"), "changed"), ((404, b""), "returned 404")):
+            result, calls = self.verify([answer])
+            self.assertEqual(len(result["problems"]), 1)
+            self.assertIn(words, result["problems"][0])
+            self.assertEqual(sum("/manifests/" in path for path in calls), 1)
+
+    def test_unavailable_registry_is_info_inside_a_fault_window(self):
+        state = checker.load_state(self.evidence)
+        state["window"] = "quorum-loss"
+        checker.save_state(self.evidence, state)
+        _, verdict = self.evaluate(self.snapshot(registry_json={"problems": [], "unavailable": ["x returned 503"]}))
+        self.assertNotIn("registry", self.failures(verdict))
+
+    def test_unavailable_registry_fails_outside_a_fault_window(self):
+        _, verdict = self.evaluate(self.snapshot(registry_json={"problems": [], "unavailable": ["x returned 503"]}))
+        self.assertIn("registry", self.failures(verdict))
+
+    def test_changed_image_fails_even_inside_a_fault_window(self):
+        state = checker.load_state(self.evidence)
+        state["window"] = "quorum-loss"
+        checker.save_state(self.evidence, state)
+        _, verdict = self.evaluate(self.snapshot(registry_json={"problems": ["x changed"], "unavailable": []}))
+        self.assertIn("registry", self.failures(verdict))
+
+
 class Recovery(Evidence):
     def test_one_leader_and_three_voters_settle(self):
         code, verdict = self.evaluate(self.snapshot(kind="settle", **{
@@ -353,7 +481,8 @@ class Record(Evidence):
             "schedule": "compressed", "started_at": NOW, "finished_at": NOW + 2400,
             "base_url": "<https://example.invalid/staging>", "candidate_digest": "`abc`",
             "soak_bun": "not supplied: upgrade slots skipped", "deviations": ["provision_isolated_workloads"],
-            "cycles": 4, "ingress_rotation_secs": 300}))
+            "cycles": 4, "ingress_rotation_secs": 300,
+            "teardown": "`relish local destroy --yes` and `relish uninstall --yes` succeeded"}))
         for offset, seconds in ((0, 40), (100, 60)):
             checker.append_event(self.evidence, ts=NOW + offset, phase="fault:bun-kill-follower", target="rb-a-2")
             checker.append_event(self.evidence, ts=NOW + offset + seconds, phase="fault:bun-kill-follower",
@@ -377,8 +506,10 @@ class Record(Evidence):
         self.assertIn("| fault:bun-kill-follower | 2 | 2 | 0 | 0 | 60 s / 60 s |", text)
         self.assertIn("| upgrade | 1 | 0 | 0 | 1 | n/a |", text)
         self.assertIn("highest ACK 20000", text)
+        self.assertIn("the writer file checks (writer-gap, writer-regression) decide data loss", text)
         self.assertIn("not supplied: upgrade slots skipped", text)
         self.assertIn("short leaf lifetimes unavailable", text)
+        self.assertIn("- Teardown: `relish local destroy --yes` and `relish uninstall --yes` succeeded", text)
 
     def test_an_open_failure_renders_fail_with_its_row(self):
         self.write_run(failures=["fault:power-off did not settle within 480 s"])
@@ -400,6 +531,58 @@ class Record(Evidence):
         record = self.evidence / "record.md"
         self.assertEqual(checker.render(self.evidence, record), 1)
         self.assertIn("| workload identity rotations (soak-identity, per node) | 1 | ≥ 5 | FAIL |", record.read_text())
+
+    def render_tier(self, tier, failures=(), **metadata):
+        self.write_run(failures=failures)
+        run = json.loads((self.evidence / "metadata.json").read_text())
+        if tier == "final":
+            run.update(schedule="full", finished_at=NOW + 8 * 3600 + 120, duration_target=8 * 3600,
+                       ingress_rotation_secs=None)
+            state = checker.load_state(self.evidence)
+            state["renewals"]["workload-identity"] = {name: 16 for name in NODES}
+            checker.save_state(self.evidence, state)
+        else:
+            run.update(duration_target=90 * 60)
+        run.update(tier=tier, **metadata)
+        (self.evidence / "metadata.json").write_text(json.dumps(run))
+        record = self.evidence / "record.md"
+        code = checker.render(self.evidence, record)
+        return code, record.read_text()
+
+    def test_a_clean_fast_tier_says_clean_but_never_claims_acceptance(self):
+        code, text = self.render_tier("fast")
+        self.assertEqual(code, 0)
+        self.assertIn("fast tier, compressed schedule", text)
+        self.assertIn("**Fast tier: clean.**", text)
+        self.assertIn("not acceptance", text)
+        self.assertNotIn("gate passes", text)
+
+    def test_a_clean_final_tier_passes_the_gate(self):
+        code, text = self.render_tier("final")
+        self.assertEqual(code, 0)
+        self.assertIn("final tier, full schedule, 8 h 02 min", text)
+        self.assertIn("**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` "
+                      "has SHA-256 `abc`", text)
+
+    def test_a_final_tier_with_an_open_failure_does_not_pass_the_gate(self):
+        code, text = self.render_tier("final", failures=["bun RSS 31% above its warm sample"])
+        self.assertEqual(code, 1)
+        self.assertIn("**Final tier: not clean. The V02 gate does not pass.**", text)
+        self.assertNotIn("gate passes", text)
+
+    def test_a_short_or_unpinned_final_tier_is_not_acceptance(self):
+        code, text = self.render_tier("final", finished_at=NOW + 4 * 3600, duration_target=4 * 3600,
+                                      candidate_digest="`not checked`")
+        self.assertEqual(code, 0)
+        self.assertIn("**Final tier: clean, but not acceptance:** it soaked for 4 h 00 min; "
+                      "the candidate digest was not checked", text)
+        self.assertNotIn("gate passes", text)
+
+    def test_a_run_without_a_tier_says_nothing_about_the_gate(self):
+        self.write_run()
+        record = self.evidence / "record.md"
+        self.assertEqual(checker.render(self.evidence, record), 0)
+        self.assertIn("**No tier (a custom run).**", record.read_text())
 
     def test_render_refuses_to_overwrite(self):
         self.write_run()

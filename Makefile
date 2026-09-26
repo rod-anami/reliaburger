@@ -1,9 +1,16 @@
-.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo readme-commands
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
 COVERAGE_MIN_LINES ?= 78.65
+# Crash-recovery tests SIGKILL instrumented Bun, owner and workload processes
+# on purpose; one killed while it writes its profile at exit leaves a
+# truncated .profraw. Skip unreadable profiles with a warning instead of
+# failing the report: they only drop that process's partial counts, which can
+# lower coverage but never inflate it. A run where no profile is readable
+# still fails.
+COVERAGE_REPORT = $(CARGO) llvm-cov report --failure-mode all
 # Extra nextest filter for test-linux, e.g. to skip suites a job already ran.
 LINUX_EXCLUDE ?=
 # Pinned public images for the Linux suites, fetched once and served on loopback.
@@ -92,9 +99,9 @@ coverage: ## Run the portable suite once under line coverage and enforce the flo
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
-	$(CARGO) llvm-cov report --lcov --output-path target/coverage/lcov.info
-	$(CARGO) llvm-cov report --html --output-dir target/coverage/html
-	$(CARGO) llvm-cov report --fail-under-lines $(COVERAGE_MIN_LINES)
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info
+	$(COVERAGE_REPORT) --html --output-dir target/coverage/html
+	$(COVERAGE_REPORT) --fail-under-lines $(COVERAGE_MIN_LINES)
 
 deploy-demo: build ## Deploy an app, show history, lint config
 	./scripts/deploy-demo.sh
@@ -114,6 +121,9 @@ pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS 
 ci: fmt-check lint test test-doc ## Run portable CI checks
 
 ci-full: fmt-check lint test bench ## Run everything including benchmarks
+
+readme-commands: ## Regenerate the relish command list in README.md from the CLI definition
+	RELIABURGER_UPDATE_README=1 $(CARGO) test --bin relish readme_command_list_matches_the_cli
 
 # --- Documentation targets ---
 

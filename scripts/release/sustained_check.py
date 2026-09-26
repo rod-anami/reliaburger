@@ -12,6 +12,7 @@ Subcommands:
   event EVIDENCE --phase P [--target T] [--command C] [--exit N] [--duration S] [--verdict V] [--detail D]
   expect EVIDENCE restart NODE          a harnessed bun kill: one systemd restart is explained
   window EVIDENCE open|close [LABEL]    faults in progress; outages are allowed while open
+  power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
   evaluate EVIDENCE SNAPSHOT            findings; exit 1 on a new failure, 3 when not yet settled
   seen EVIDENCE KEY                     exit 0 if a harness failure KEY was bundled in the last half hour
@@ -50,6 +51,11 @@ RSS_GROWTH = 1.25
 FD_WINDOW = 6 * 3600
 REPEAT_WINDOW = 1800
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
+# Pickle resolves every tag through the council's committed catalogue and
+# answers 503 while there is no leader. A few tries ride out an election;
+# a quorum loss outlasts them and is judged against the fault window.
+REGISTRY_UNAVAILABLE_TRIES = 3
+REGISTRY_UNAVAILABLE_PAUSE = 5
 
 
 # --- state -----------------------------------------------------------------
@@ -139,14 +145,16 @@ def instances_by_node(status):
 
 # --- invariants (pure) -------------------------------------------------------
 
-def sequence_findings(check, values, highest, target=None):
-    """A strictly increasing counter must never go backwards (writer ACKs, redis INCRs)."""
+def sequence_findings(check, values, highest, source, target=None):
+    """Log-view ordering: the writer's ACKs and redis INCRs, as `relish logs`
+    returns them, must keep rising. Still failures, but about the order the
+    log view shows, not what was stored; `source` says what decides that."""
     findings = []
     for before, after in zip(values, values[1:]):
         if after <= before:
-            findings.append(finding(check, "fail", f"went backwards from {before} to {after}", target))
+            findings.append(finding(check, "fail", f"log view went backwards from {before} to {after} ({source})", target))
     if values and highest is not None and values[-1] < highest:
-        findings.append(finding(check, "fail", f"latest value {values[-1]} is below the {highest} acknowledged earlier", target))
+        findings.append(finding(check, "fail", f"log view ends at {values[-1]}, below the {highest} an earlier check saw ({source})", target))
     return findings
 
 
@@ -390,17 +398,45 @@ def evaluate(evidence, snapshot):
             findings.append(finding("ingress-http", "info" if fault_window else "fail",
                                     "podinfo answered " + (http.strip() or "nothing")))
 
-    for check, name, prefix in (("writer-ack", "writer-log.txt", "ACK"), ("redis-counter", "redis-log.txt", "INCR")):
+    # The writer file (writer-gap, writer-regression) is the data-loss check;
+    # these only see lines through the log view. State keeps the old keys:
+    # state[check] is the highest value ever seen and never goes down (the
+    # writer-regression check compares the file against it), while
+    # "log-baseline" is what the next tail must not end below.
+    baselines = state.setdefault("log-baseline", {})
+    power_cut_excused = False
+    advanced = False
+    for check, order_check, name, prefix, source in (
+            ("writer-ack", "writer-log-order", "writer-log.txt", "ACK",
+             "line order in the log view; the writer file checks decide data loss"),
+            ("redis-counter", "redis-log-order", "redis-log.txt", "INCR",
+             "line order in the log view, not a read of the stored counter")):
         text = read(snapshot, name)
         if text is None:
             continue
         values = parse_sequence(text, prefix)
-        findings += sequence_findings(check, values, state.get(check))
+        baseline = baselines.get(check, state.get(check))
+        order = sequence_findings(order_check, values, baseline, source)
+        if state.get("power_cut") and values and baseline is not None and values[-1] < baseline:
+            # A powered-off node loses the stdout it hadn't synced yet, as any
+            # log does; the tail may end below what an earlier check saw. Only
+            # the "ends below" finding is excused, and the baseline restarts
+            # from here; lines going backwards within one tail still fail.
+            order = [dict(item, severity="info", detail=item["detail"] + "; after a power cut, lines not yet synced are lost from the log view")
+                     if "below the" in item["detail"] else item for item in order]
+            baselines[check] = values[-1]
+            power_cut_excused = True
+        elif values:
+            advanced = advanced or baseline is None or values[-1] > baseline
+            baselines[check] = max(values[-1], baseline or 0)
+        findings += order
         if values:
             if values[-1] == state.get(check) and not fault_window:
                 findings.append(finding(check, "warn", f"not advancing at {values[-1]}"))
             state[check] = max(values[-1], state.get(check, 0))
             state.setdefault("progress", {})[check] = values[-1]
+    if state.get("power_cut") and not fault_window and advanced and not power_cut_excused:
+        state.pop("power_cut")
 
     writer = read(snapshot, "writer-file.txt")
     if writer is not None:
@@ -461,6 +497,10 @@ def evaluate(evidence, snapshot):
     if registry is not None:
         for problem in registry.get("problems", []):
             findings.append(finding("registry", "fail", problem))
+        # Refusing reads without a leader is Pickle failing closed, not data
+        # loss. Outside a fault window nothing excuses it.
+        for problem in registry.get("unavailable", []):
+            findings.append(finding("registry", "info" if fault_window else "fail", problem))
 
     clean = None
     if meta.get("kind") in ("settle", "heavy"):
@@ -668,6 +708,27 @@ def registry_push_blob(args, repository, data):
     return digest
 
 
+def registry_get(args, path, headers=None):
+    """GET from Pickle, retrying a 503 a bounded number of times."""
+    for attempt in range(REGISTRY_UNAVAILABLE_TRIES):
+        if attempt:
+            time.sleep(REGISTRY_UNAVAILABLE_PAUSE)
+        status, _, body = registry_request(args, "GET", path, None, headers)
+        if status != 503:
+            break
+    return status, body
+
+
+def registry_judge(result, what, status, body, digest):
+    """A 503 means the catalogue is unavailable; anything else must be the exact bytes."""
+    if status == 503:
+        result["unavailable"].append(f"{what} returned 503 after {REGISTRY_UNAVAILABLE_TRIES} tries")
+    elif status != 200:
+        result["problems"].append(f"{what} returned {status}")
+    elif "sha256:" + hashlib.sha256(body).hexdigest() != digest:
+        result["problems"].append(f"{what} changed")
+
+
 def registry_command(args):
     """Push a tiny unique image, or re-fetch every pushed one and check its bytes."""
     state = load_state(args.evidence)
@@ -693,15 +754,14 @@ def registry_command(args):
                            "blobs": [layer_digest, config_digest]})
             result["pushed"] = args.tag
         else:
+            result["unavailable"] = []
             for image in pushed:
-                status, _, body = registry_request(args, "GET", f"/v2/{repository}/manifests/{image['tag']}", None,
-                                                   {"Accept": "application/vnd.oci.image.manifest.v1+json"})
-                if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != image["manifest"]:
-                    result["problems"].append(f"{repository}:{image['tag']} manifest returned {status} or changed")
+                status, body = registry_get(args, f"/v2/{repository}/manifests/{image['tag']}",
+                                            {"Accept": "application/vnd.oci.image.manifest.v1+json"})
+                registry_judge(result, f"{repository}:{image['tag']} manifest", status, body, image["manifest"])
                 for digest in image["blobs"]:
-                    status, _, body = registry_request(args, "GET", f"/v2/{repository}/blobs/{digest}")
-                    if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != digest:
-                        result["problems"].append(f"{repository} blob {digest[:19]} returned {status} or changed")
+                    status, body = registry_get(args, f"/v2/{repository}/blobs/{digest}")
+                    registry_judge(result, f"{repository} blob {digest[:19]}", status, body, digest)
                 result["checked"] += 1
     except (OSError, RuntimeError, ssl.SSLError, http.client.HTTPException) as error:
         # Unreachable is not data loss; the next check retries.
@@ -733,6 +793,38 @@ def failure_rows(evidence):
 def expected_renewals(elapsed, period):
     """Renewals a node must show: one per half-lifetime, less one for phase."""
     return max(0, int(elapsed // period) - 1)
+
+
+FINAL_TIER_SECONDS = 8 * 3600
+
+
+def acceptance_line(metadata, result, elapsed):
+    """What the run says about the V02 gate (plan D3): only a clean final tier passes it."""
+    tier = metadata.get("tier") or "custom"
+    clean = result == "PASS"
+    if tier == "fast":
+        if clean:
+            return ("**Fast tier: clean.** The iteration loop only, not acceptance: the V02 gate needs a clean "
+                    "final-tier run (8 h, full schedule) on the final candidate.")
+        return "**Fast tier: not clean.** Fix what failed and run the fast tier again before a final-tier run."
+    if tier != "final":
+        return "**No tier (a custom run).** Neither tier's evidence, so it says nothing about the V02 gate."
+    if not clean:
+        return ("**Final tier: not clean. The V02 gate does not pass.** A product fix means a fresh fast-tier run, "
+                "then a fresh final-tier run.")
+    shortfalls = []
+    if metadata.get("schedule", "full") != "full":
+        shortfalls.append(f"it ran the {metadata['schedule']} schedule")
+    if min(elapsed, metadata.get("duration_target") or 0) < FINAL_TIER_SECONDS:
+        shortfalls.append(f"it soaked for {duration_text(elapsed)}")
+    digest = metadata.get("candidate_digest") or "`not checked`"
+    if "not checked" in digest:
+        shortfalls.append("the candidate digest was not checked (--qualified-digest)")
+    if shortfalls:
+        return (f"**Final tier: clean, but not acceptance:** {'; '.join(shortfalls)}. The V02 gate needs 8 h on "
+                "the full schedule against a pinned candidate.")
+    return (f"**Final tier: clean. The V02 soak gate passes** for the candidate whose `candidate.json` has "
+            f"SHA-256 {digest}, if it is the final candidate.")
 
 
 def render(evidence, record):
@@ -771,9 +863,11 @@ def render(evidence, record):
     if (open_failures or gate_failed) and result == "PASS":
         result = "FAIL"
 
+    tier = metadata.get("tier") or "custom"
     lines = [f"# Sustained soak (V02): {result}", ""]
-    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {metadata.get('schedule', 'full')} schedule, "
-              f"{duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
+    lines += [f"{time.strftime('%-d %B %Y', time.gmtime(started))}. {tier} tier, {metadata.get('schedule', 'full')} "
+              f"schedule, {duration_text(elapsed)} of soak on a three-node quickstart cluster.", ""]
+    lines += [acceptance_line(metadata, result, elapsed), ""]
     lines += ["## Candidate and host", "", "| | |", "|---|---|"]
     for key, label in (("base_url", "Staged base URL"), ("candidate_digest", "`candidate.json` SHA-256"),
                        ("versions", "Running versions"), ("soak_bun", "Soak build"), ("host", "Host"),
@@ -789,6 +883,8 @@ def render(evidence, record):
     if paused:
         lines.append(f"- Soak clock paused for {duration_text(paused)} (environment)")
     lines.append(f"- Cycles completed: {metadata.get('cycles', 0)}")
+    if metadata.get("teardown"):
+        lines.append(f"- Teardown: {metadata['teardown']}")
     lines.append("")
 
     counts = {}
@@ -817,8 +913,10 @@ def render(evidence, record):
     lines.append("")
     progress = state.get("progress", {})
     lines += ["## Data", "",
-              f"- Volume writer: highest ACK {state.get('writer-ack', 'none')}",
-              f"- Redis counter: highest {state.get('redis-counter', 'none')}"]
+              f"- Volume writer: highest ACK {state.get('writer-ack', 'none')} in the log view; "
+              "the writer file checks (writer-gap, writer-regression) decide data loss, "
+              "and `*-log-order` failures are about the order the log view returned lines in",
+              f"- Redis counter: highest INCR {state.get('redis-counter', 'none')} in the log view"]
     for node, count in sorted(state.get("export_counts", {}).items()):
         lines.append(f"- Export {node}: {count['source']} source files, {count['destination']} at the destination")
     lines.append(f"- Registry images pushed and re-verified: {len(state.get('registry_pushed', []))}")
@@ -881,6 +979,8 @@ def main(argv=None):
     expect.add_argument("evidence")
     expect.add_argument("what", choices=["restart"])
     expect.add_argument("node")
+    power_cut = commands.add_parser("power-cut", help="a node's power was cut: the log view may lose unsynced lines")
+    power_cut.add_argument("evidence")
     window = commands.add_parser("window")
     window.add_argument("evidence")
     window.add_argument("action", choices=["open", "close", "settled"])
@@ -929,6 +1029,11 @@ def main(argv=None):
         state = load_state(args.evidence)
         restarts = state.setdefault("restarts", {}).setdefault(args.node, {"boot": None, "n": 0, "expected": 0})
         restarts["expected"] += 1
+        save_state(args.evidence, state)
+        return 0
+    if args.command == "power-cut":
+        state = load_state(args.evidence)
+        state["power_cut"] = True
         save_state(args.evidence, state)
         return 0
     if args.command == "window":

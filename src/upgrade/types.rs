@@ -156,6 +156,13 @@ pub enum ClusterUpgradePhase {
     Paused {
         reason: String,
     },
+    /// Ended by the operator from `Paused` without finishing
+    /// (`relish upgrade abort`, or a cluster rollback that replaced it).
+    /// Terminal: the orchestrator archives it to history. Appended last
+    /// because the Raft log encodes enum variants by index.
+    Aborted {
+        reason: String,
+    },
 }
 
 /// A node's role at plan time (decides its position in the rolling order).
@@ -179,6 +186,24 @@ pub struct NodeUpgradeRecord {
     /// When the node entered its current phase (drives stuck-node timeouts).
     #[serde(default)]
     pub since: Option<std::time::SystemTime>,
+    /// A still-`Pending` node whose directive hit a transient failure (its
+    /// registry or API briefly unreachable). The orchestrator re-sends until
+    /// the retry window runs out; `None` once delivered or failed for good.
+    #[serde(default)]
+    pub directive_retry: Option<DirectiveRetry>,
+}
+
+/// Transient directive failures the orchestrator is riding out for one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectiveRetry {
+    /// Attempts so far, all of which failed transiently.
+    pub attempts: u32,
+    /// When the first attempt failed: the retry window counts from here.
+    pub first_failed_at: std::time::SystemTime,
+    /// When the latest attempt failed: the backoff counts from here.
+    pub last_failed_at: std::time::SystemTime,
+    /// What the latest attempt said, for status output and the pause reason.
+    pub last_error: String,
 }
 
 /// Per-node phase within the cluster upgrade.

@@ -65,6 +65,8 @@ pub struct RunConfig {
     /// per-case isolation against a live cluster.
     pub fixed_namespace: Option<String>,
     pub(crate) lease_ownership: LeaseOwnership,
+    /// How cases reach peer nodes (see [`PeerRoute::detect`]).
+    pub peer_route: crate::testkit::context::PeerRoute,
 }
 
 /// Invalid runner input, rejected before tasks, leases or requests are created.
@@ -150,6 +152,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
         let name = case.name.to_string();
         let group = case.group;
         let lease_ownership = config.lease_ownership;
+        let peer_route = config.peer_route;
 
         let handle = set.spawn(async move {
             // Acquire *inside* the task, not before spawning: the semaphore is
@@ -166,6 +169,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
                 timeout,
                 profile,
                 lease_ownership,
+                peer_route,
             )
             .await;
             Indexed { index, result }
@@ -221,6 +225,8 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
 }
 
 /// Run one case: skip-check, timed execution, then unconditional teardown.
+// Each argument is one per-run setting the case context is built from.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     case: &TestCase,
     client: BunClient,
@@ -229,6 +235,7 @@ async fn run_one(
     timeout: Duration,
     profile: TestProfile,
     lease_ownership: LeaseOwnership,
+    peer_route: crate::testkit::context::PeerRoute,
 ) -> TestCaseResult {
     let start = Instant::now();
     let started_at = now_rfc3339();
@@ -450,6 +457,8 @@ async fn run_one(
         capabilities: capabilities.clone(),
         timeout,
         deadline,
+        peer_route,
+        wait_note: Default::default(),
     };
 
     // The case body gets its own task so a panic is data and the outer owner
@@ -472,7 +481,16 @@ async fn run_one(
             // lease has been released.
             body.abort();
             let _ = body.await;
-            TestOutcome::timed_out("case", deadline.budget_ms())
+            let mut outcome = TestOutcome::timed_out("case", deadline.budget_ms());
+            // The case's own wait gives up on this same deadline, usually a
+            // moment too late to return its message. It left a note instead.
+            if let (Some(note), TestOutcome::Unknown { reason, .. }) =
+                (context.wait_note.take().await, &mut outcome)
+            {
+                reason.push_str("; it was still ");
+                reason.push_str(&note);
+            }
+            outcome
         }
     };
 
@@ -618,6 +636,7 @@ mod tests {
             profile: TestProfile::Development,
             fixed_namespace: None,
             lease_ownership: LeaseOwnership::UnleasedForUnitTests,
+            peer_route: crate::testkit::context::PeerRoute::Direct,
         }
     }
 
@@ -893,6 +912,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// V02 soak: C2's own wait knew it was stuck on three running replicas,
+    /// but the runner's deadline fired first and the report said only
+    /// "exceeded its deadline". A timeout now carries what the case's last
+    /// wait was waiting for, without the body outliving its deadline.
+    #[tokio::test]
+    async fn a_timed_out_case_reports_what_its_last_wait_was_waiting_for() {
+        async fn stuck(ctx: TestContext) -> Result<(), String> {
+            // Stand in for the runner winning the race with the wait's own
+            // error: the body never gets to return it.
+            let _ = ctx
+                .wait_for_cluster("web", "3 running replica(s)", |_| false)
+                .await;
+            std::future::pending().await
+        }
+        let cases = vec![case("stuck", &[], testkit_case!(stuck))];
+        let mut cfg = config(dead_client(), full_capabilities(), 4);
+        cfg.timeout = Duration::from_millis(300);
+
+        let report = run(cases, cfg).await.unwrap();
+
+        match &report.results[0].outcome {
+            TestOutcome::Unknown { kind, reason } => {
+                assert_eq!(*kind, UnknownKind::TimedOut);
+                assert!(reason.contains("exceeded its 300 ms deadline"), "{reason}");
+                assert!(
+                    reason.contains("waiting for web to reach 3 running replica(s) cluster-wide"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
     }
 
     #[tokio::test]

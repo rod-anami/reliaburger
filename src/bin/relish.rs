@@ -403,7 +403,7 @@ enum Command {
         #[command(subcommand)]
         action: DevAction,
     },
-    /// Rolling binary upgrades (Phase 14).
+    /// Roll a new bun binary across the cluster, or back.
     Upgrade {
         #[command(subcommand)]
         action: UpgradeAction,
@@ -579,7 +579,7 @@ enum ManualAction {
 
 #[derive(Subcommand)]
 enum CouncilCommand {
-    /// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
+    /// Recover a cluster whose entire council was lost.
     ///
     /// Run this against a STOPPED surviving node. It restores the desired
     /// state from a sealed backup (or this node's own durable snapshot),
@@ -671,6 +671,9 @@ enum UpgradeAction {
     },
     /// Resume a paused upgrade.
     Resume,
+    /// End a paused upgrade in which no node has moved. When some nodes
+    /// already swapped, use `rollback <version>` instead.
+    Abort,
 }
 
 #[derive(Subcommand)]
@@ -872,6 +875,22 @@ enum DevAction {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
         /// Binary to sign.
+        binary: std::path::PathBuf,
+    },
+    /// Add your external signature to a release binary's .sig envelope,
+    /// keeping the release signature as it is (no release key needed).
+    CountersignBinary {
+        /// PKCS#8 Ed25519 private key (DER), e.g. from `relish dev keygen`
+        /// or `openssl genpkey -algorithm ed25519 -outform DER`.
+        #[arg(long)]
+        external_key: std::path::PathBuf,
+        /// The release envelope to countersign (default: {binary}.sig).
+        #[arg(long)]
+        sig: Option<std::path::PathBuf>,
+        /// Where to write the countersigned envelope (default: over --sig).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Binary the envelope belongs to.
         binary: std::path::PathBuf,
     },
 }
@@ -1641,6 +1660,18 @@ async fn main() -> ExitCode {
                 external_key.as_deref(),
                 out.as_deref(),
             ),
+            DevAction::CountersignBinary {
+                external_key,
+                sig,
+                out,
+                binary,
+            } => reliaburger::relish::dev::countersign_binary(
+                external_key,
+                binary,
+                sig.as_deref(),
+                out.as_deref(),
+            )
+            .map(|_| ()),
         },
         Command::Upgrade { action } => {
             let client = reliaburger::relish::client::BunClient::default_local();
@@ -1687,6 +1718,7 @@ async fn main() -> ExitCode {
                     node_addresses,
                 } => reliaburger::relish::upgrade::rollback(&client, version, node_addresses).await,
                 UpgradeAction::Resume => reliaburger::relish::upgrade::resume(&client).await,
+                UpgradeAction::Abort => reliaburger::relish::upgrade::abort(&client).await,
             }
         }
         Command::Manual {
@@ -1886,6 +1918,34 @@ mod tests {
             output: cli.output,
             token: cli.token,
         })
+    }
+
+    /// The README's command list is rendered from `Cli`. With
+    /// `RELIABURGER_UPDATE_README` set (`make readme-commands`), this test
+    /// rewrites the region instead of checking it.
+    // Import and export only exist with the default `kubernetes` feature, so
+    // the README describes that build.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn readme_command_list_matches_the_cli() {
+        use clap::CommandFactory;
+        use reliaburger::relish::command_reference::{
+            GROUPS, REGENERATE_COMMAND, render, replace_region,
+        };
+
+        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        let section = render(&Cli::command(), GROUPS).unwrap_or_else(|e| panic!("{e}"));
+        let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
+
+        if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {
+            std::fs::write(&readme_path, &updated).unwrap();
+            return;
+        }
+        assert!(
+            updated == readme,
+            "README.md's relish command list is out of date; run `{REGENERATE_COMMAND}`"
+        );
     }
 
     #[test]

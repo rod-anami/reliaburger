@@ -15,10 +15,12 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including committed generation-bound consumer withdrawal receipts.
+/// Supported formats, including the per-node `directive_retry` record in a
+/// cluster upgrade and the 503 a node answers a directive with when the
+/// binary's registry is unavailable (the orchestrator retries it).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 24,
-    state: 40,
+    protocol: 27,
+    state: 43,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

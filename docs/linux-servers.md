@@ -50,16 +50,16 @@ Assign hostnames or static IP addresses to your three VMs. For this guide, we us
 
 | Node ID | Role | Example IP |
 |---------|------|------------|
-| `node-01` | One-burger node, Council voter | `192.168.0.101` |
-| `node-02` | Side-burger node, Council voter | `192.168.0.102` |
-| `node-03` | Side-burger node, Council voter | `192.168.0.103` |
+| `node-01` | Bootstrap node, Council voter | `192.168.0.101` |
+| `node-02` | Joining node, Council voter | `192.168.0.102` |
+| `node-03` | Joining node, Council voter | `192.168.0.103` |
 
 Ensure the following ports are open between the nodes:
 
 | Port | Protocol | Purpose | Direction |
 |------|----------|---------|-----------|
 | `9117` | TCP | Bun API and Web Dashboard (Brioche) | Intersite / Operator |
-| `9443` | TCP/UDP | SWIM Gossip (Mustard) | Node-to-node |
+| `9443` | UDP | SWIM Gossip (Mustard) | Node-to-node |
 | `9444` | TCP | Raft consensus (Council) | Node-to-node |
 | `9445` | TCP | State reporting tree (Mayo) | Node-to-node |
 | `5050` | TCP | Pickle OCI image registry | Intersite / Node-to-node |
@@ -69,15 +69,15 @@ Ensure the following ports are open between the nodes:
 To quickly open these ports on host firewalls:
 
 - **On Debian / Ubuntu (`ufw`)**:
-  ```sh
-  sudo ufw allow 9117/tcp && sudo ufw allow 9443/tcp && sudo ufw allow 9443/udp && sudo ufw allow 9444/tcp && sudo ufw allow 9445/tcp && sudo ufw allow 5050/tcp && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp
-  ```
+```sh
+sudo ufw allow 9117/tcp && sudo ufw allow 9443/tcp && sudo ufw allow 9443/udp && sudo ufw allow 9444/tcp && sudo ufw allow 9445/tcp && sudo ufw allow 5050/tcp && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp
+```
 
 - **On RHEL 9 / Rocky Linux 9 / AlmaLinux 9 (`firewalld`)**:
-  ```sh
-  sudo firewall-cmd --permanent --add-port={9117/tcp,9443/tcp,9443/udp,9444/tcp,9445/tcp,5050/tcp,80/tcp,443/tcp}
-  sudo firewall-cmd --reload
-  ```
+```sh
+sudo firewall-cmd --permanent --add-port={9117/tcp,9443/tcp,9443/udp,9444/tcp,9445/tcp,5050/tcp,80/tcp,443/tcp}
+sudo firewall-cmd --reload
+```
 
 ---
 
@@ -144,22 +144,24 @@ the initial security bootstrap state, and its own node identity.
 On **Node 1 (`192.168.0.101`)**, run:
 
 ```sh
-cd /etc/reliaburger
 sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01
 ```
 
 This writes the following files under `/etc/reliaburger`:
 - `prod-master.key`: Master secret key (used to encrypt CA and secrets).
 - `prod-security-bootstrap.json`: Initial cluster security state.
+- `prod-root-ca.age`: The sealed root CA key.
+- `reliaburger.toml`: Sample cluster node config file.
+- `app.toml`: Sample application manifest file.
 - `identity/`: Node 1's mTLS certificates (`node.crt`, `node.key`, `root-ca.crt`, etc.).
 
-Make a note of the **Root CA fingerprint** printed to stderr (e.g. `sha256:abcd...`). You can also inspect it later.
+> **Important**: Make a note of the **Root CA fingerprint** printed to stderr (e.g. `sha256:abcd...`). You can also inspect it later. Also, backup the `prod-master.key` and `prod-root-ca.age` together.
 
 ### 3.2 Write the Node 1 configuration
 
 Create `/etc/reliaburger/node.toml` on **Node 1**:
 
-```toml
+```ini
 [node]
 name = "node-01"
 
@@ -192,6 +194,10 @@ https_port = 443
 
 [images]
 registry_port = 5050
+
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults", "alter_node_state"]
 ```
 
 ### 3.3 Set up the systemd service and start Bun
@@ -266,17 +272,17 @@ Now that the token store is populated, if you want Node 1's API to be accessible
 
 1. Edit `/etc/systemd/system/reliaburger.service` and change `--listen 127.0.0.1:9117` to `--listen 0.0.0.0:9117`.
 2. Reload and restart:
-   ```sh
-   sudo systemctl daemon-reload
-   sudo systemctl restart reliaburger.service
-   ```
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart reliaburger.service
+```
 3. Update `RELIABURGER_ENDPOINT`:
-   ```sh
-   export RELIABURGER_ENDPOINT="https://192.168.0.101:9117"
-   export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
-   export RELIABURGER_TOKEN="<YOUR_ADMIN_TOKEN>"
-   relish status
-   ```
+```sh
+export RELIABURGER_ENDPOINT="https://192.168.0.101:9117"
+export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
+export RELIABURGER_TOKEN="<YOUR_ADMIN_TOKEN>"
+relish status
+```
 
 ---
 
@@ -294,11 +300,11 @@ Copy the key to Node 2 and Node 3:
 ```sh
 # Copy to Node 2
 sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.102 \
-  'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
+'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
 
 # Copy to Node 3
 sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.102 \
-  'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
+'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
 ```
 
 > **Note**: `prod` is the name of reliaburger cluster initialized at the beginning of this procedure.
@@ -352,56 +358,80 @@ On **Node 2 (`192.168.0.102`)**:
 
 1. Enroll node identity using `relish join`:
 
-   ```sh
-   sudo relish join \
-     --token "<TOKEN_FOR_NODE_02>" \
-     --node-id node-02 \
-     --identity-dir /etc/reliaburger/identity \
-     --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
-     https://192.168.0.101:9117
-   ```
+```sh
+sudo relish join \
+  --token-file "<FILE_WITH_NODE02_TOKEN>" \
+  --node-id node-02 \
+  --identity-dir /etc/reliaburger/identity \
+  --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
+  https://192.168.0.101:9117
+```
 
 2. Create `/etc/reliaburger/node.toml` on **Node 2**:
 
+```toml
+[node]
+name = "node-02"
+
+[cluster]
+name = "prod"
+join = ["192.168.0.101:9443"]
+
+[network]
+advertise_address = "192.168.0.102"
+
+[security]
+require_mtls = true
+identity_dir = "/etc/reliaburger/identity"
+master_key_path = "/etc/reliaburger/prod-master.key"
+bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.103"]
+
+[ebpf]
+enabled = true
+
+[dns]
+enabled = true
+listen = "192.168.0.102:53"
+
+[ingress]
+enabled = true
+http_port = 80
+https_port = 443
+
+[images]
+registry_port = 5050
+
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults", "alter_node_state"]
+```
+
+3. Create `/etc/systemd/system/reliaburger.service` and start Bun:
+
 ```ini
-   [node]
-   name = "node-02"
+[Unit]
+Description=Reliaburger node
+After=network-online.target
+Wants=network-online.target
 
-   [cluster]
-   name = "prod"
-   join = ["192.168.0.101:9443"]
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+KillMode=process
+TimeoutStopSec=30
 
-   [network]
-   advertise_address = "192.168.0.102"
+[Install]
+WantedBy=multi-user.target
+```
 
-   [security]
-   require_mtls = true
-   identity_dir = "/etc/reliaburger/identity"
-   master_key_path = "/etc/reliaburger/prod-master.key"
-   bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.103"]
-
-   [ebpf]
-   enabled = true
-
-   [dns]
-   enabled = true
-   listen = "192.168.0.102:53"
-
-   [ingress]
-   enabled = true
-   http_port = 80
-   https_port = 443
-
-   [images]
-   registry_port = 5050
-   ```
-
-3. Create `/etc/systemd/system/reliaburger.service` (same as Node 1) and start Bun:
-
-   ```sh
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now reliaburger.service
-   ```
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now reliaburger.service
+```
 
 ### 4.4 Enroll Node 3 (`node-03`)
 
@@ -409,56 +439,80 @@ On **Node 3 (`192.168.0.103`)**:
 
 1. Enroll node identity using `relish join`:
 
-   ```sh
-   sudo relish join \
-     --token "<TOKEN_FOR_NODE_03>" \
-     --node-id node-03 \
-     --identity-dir /etc/reliaburger/identity \
-     --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
-     https://192.168.0.101:9117
-   ```
+```sh
+sudo relish join \
+  --token-file "<FILE_WITH_NODE03_TOKEN>" \
+  --node-id node-03 \
+  --identity-dir /etc/reliaburger/identity \
+  --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
+  https://192.168.0.101:9117
+```
 
 2. Create `/etc/reliaburger/node.toml` on **Node 3**:
 
-   ```ini
-   [node]
-   name = "node-03"
+```toml
+[node]
+name = "node-03"
 
-   [cluster]
-   name = "prod"
-   join = ["192.168.0.101:9443"]
+[cluster]
+name = "prod"
+join = ["192.168.0.101:9443"]
 
-   [network]
-   advertise_address = "192.168.0.103"
+[network]
+advertise_address = "192.168.0.103"
 
-   [security]
-   require_mtls = true
-   identity_dir = "/etc/reliaburger/identity"
-   master_key_path = "/etc/reliaburger/prod-master.key"
-   bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.103"]
+[security]
+require_mtls = true
+identity_dir = "/etc/reliaburger/identity"
+master_key_path = "/etc/reliaburger/prod-master.key"
+bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.103"]
 
-   [ebpf]
-   enabled = true
+[ebpf]
+enabled = true
 
-   [dns]
-   enabled = true
-   listen = "192.168.0.103:53"
+[dns]
+enabled = true
+listen = "192.168.0.103:53"
 
-   [ingress]
-   enabled = true
-   http_port = 80
-   https_port = 443
+[ingress]
+enabled = true
+http_port = 80
+https_port = 443
 
-   [images]
-   registry_port = 5050
-   ```
+[images]
+registry_port = 5050
+
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults", "alter_node_state"]
+```
 
 3. Create `/etc/systemd/system/reliaburger.service` and start Bun:
 
-   ```sh
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now reliaburger.service
-   ```
+```ini
+[Unit]
+Description=Reliaburger node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+ExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now reliaburger.service
+```
 
 ---
 
@@ -595,7 +649,7 @@ interval = 2
 threshold_healthy = 1
 
 [app.hello.ingress]
-host = "hello.internal"
+host = "hello.world.test"
 path = "/"
 
 [app.hello.env]
@@ -635,9 +689,9 @@ relish logs hello
 Send an HTTP request via the ingress proxy on any of the three VM IP addresses:
 
 ```sh
-curl -H "Host: hello.internal" http://192.168.0.101/
-curl -H "Host: hello.internal" http://192.168.0.102/
-curl -H "Host: hello.internal" http://192.168.0.103/
+curl -H "Host: hello.world.test" http://192.168.0.101/
+curl -H "Host: hello.world.test" http://192.168.0.102/
+curl -H "Host: hello.world.test" http://192.168.0.103/
 ```
 
 Response:
@@ -653,7 +707,8 @@ Launch a temporary, authenticated browser session on your laptop:
 relish dashboard
 ```
 
-Relish terminates the mTLS connection and opens the Brioche dashboard locally in your default web browser (press `Ctrl-C` when done).
+Relish opens the Brioche dashboard locally using read-only session over TLS with a bearer token 
+to your default web browser (press `Ctrl-C` when done).
 
 ---
 
@@ -669,7 +724,7 @@ relish apply hello.toml
 
 Then check `relish status` to observe the new replicas being placed across the nodes.
 
-### 8.2 Testing node failure and self-healing
+### 8.2 Testing node communication failure and self-healing
 
 Simulate the loss of `node-03`:
 
@@ -678,11 +733,13 @@ Simulate the loss of `node-03`:
 sudo systemctl stop reliaburger.service
 ```
 
+> **Note**: `systemctl stop reliaburger.service` doesn't quite simulate losing the node completely, but it interrupts the communication and schedule new workloads. The systemd unit uses `KillMode=process`, and container owners are designed to outlive Bun, so node 3's containers keep serving while the cluster reschedules them elsewhere.
+
 From your laptop, observe the cluster behaviour:
 
 1. **Council quorum**: `relish council` confirms that `node-01` and `node-02` maintain quorum (2 out of 3 votes).
 2. **Workload rescheduling**: `relish status` shows the scheduler automatically moving workloads from `node-03` to the surviving nodes.
-3. **Ingress continuity**: `curl -H "Host: hello.internal" http://192.168.0.101/` continues serving traffic seamlessly.
+3. **Ingress continuity**: `curl -H "Host: hello.world.test" http://192.168.0.101/` continues serving traffic seamlessly.
 
 Restart Node 3:
 
@@ -692,6 +749,50 @@ sudo systemctl start reliaburger.service
 ```
 
 Node 3 rejoins gossip, catches up with the Raft log, and resumes serving as an active council member and workload node.
+
+### 8.3 Chaos testing and fault injection (Smoker)
+
+Reliaburger includes a built-in chaos engineering subsystem (Smoker) for injecting controlled network, workload, and node faults directly via `relish fault`.
+
+#### 1. Cluster Safety Policy
+Because destructive operations can affect live clusters, the `bun` agent enforces a server-side safety policy (`[testing]` section in `/etc/reliaburger/node.toml`). Ensure your nodes have:
+
+```ini
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults", "alter_node_state"]
+```
+
+> **Note**: On production or unconfigured clusters (`safety_class = "unknown"`), fault injection is blocked by default (`403: cluster policy does not allow this operation`). Destructive operations also require the `--acknowledge` flag.
+
+#### 2. Simulate node failure with `node-kill`
+Simulate an abrupt node failure on `node-03` for 5 minutes:
+
+```sh
+relish fault node-kill node-03 --duration 5m --acknowledge
+```
+
+View active faults across the cluster:
+
+```sh
+relish fault list
+```
+
+Clear the fault before the timer expires:
+
+```sh
+relish fault clear
+```
+
+#### 3. Inject workload-level faults
+- **Add 200ms latency to traffic**:
+```sh
+relish fault delay hello 200ms --duration 2m --acknowledge
+```
+- **Simulate packet loss (25% packet drop)**:
+```sh
+relish fault drop hello --loss 25% --duration 2m --acknowledge
+```
 
 ---
 

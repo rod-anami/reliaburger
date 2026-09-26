@@ -18,18 +18,24 @@ managed Lima VMs instead, see the [quickstart guide](quickstart.md).
 
 Every node must meet the following minimum specification:
 
-- **OS / Architecture**: Linux x86_64 or aarch64 (e.g. Ubuntu 22.04+, Debian 12+, RHEL 9+).
+- **OS / Architecture**: Linux x86_64 or aarch64 (e.g. Ubuntu 24.04+, Debian 12+, RHEL 9+).
 - **Kernel**: Linux 5.8 or later with cgroup v2 enabled.
 - **Privileges**: Root or `sudo` access on all three nodes.
 - **BPF filesystem**: `bpffs` mounted at `/sys/fs/bpf`.
 - **Resources**: At least 2 CPU cores, 2 GiB RAM, and 10 GiB available disk space per node.
-- **Required packages**: `runc`, `uidmap` (or `shadow-utils`), `nftables`, `btrfs-progs`, and `curl`.
+- **Required packages**: `runc`, `uidmap` (or `shadow-utils`), `iptables`, `iproute2` (or `iproute`), `nftables`, `btrfs-progs`, and `curl`.
 
-Install the required packages on all three nodes (Debian/Ubuntu example):
+Install the required packages on all three nodes:
 
+**Debian / Ubuntu:**
 ```sh
 sudo apt-get update
-sudo apt-get install -y runc uidmap btrfs-progs nftables curl
+sudo apt-get install -y runc uidmap iptables iproute2 btrfs-progs nftables curl
+```
+
+**RHEL 9 / Rocky Linux 9 / AlmaLinux 9:**
+```sh
+sudo dnf install -y runc shadow-utils iptables iproute btrfs-progs nftables curl
 ```
 
 Ensure the BPF virtual filesystem is mounted:
@@ -60,6 +66,19 @@ Ensure the following ports are open between the nodes:
 | `53` | UDP/TCP | Service discovery DNS (`.internal`) | Node-to-node |
 | `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External / Ingress |
 
+To quickly open these ports on host firewalls:
+
+- **On Debian / Ubuntu (`ufw`)**:
+  ```sh
+  sudo ufw allow 9117/tcp && sudo ufw allow 9443/tcp && sudo ufw allow 9443/udp && sudo ufw allow 9444/tcp && sudo ufw allow 9445/tcp && sudo ufw allow 5050/tcp && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp
+  ```
+
+- **On RHEL 9 / Rocky Linux 9 / AlmaLinux 9 (`firewalld`)**:
+  ```sh
+  sudo firewall-cmd --permanent --add-port={9117/tcp,9443/tcp,9443/udp,9444/tcp,9445/tcp,5050/tcp,80/tcp,443/tcp}
+  sudo firewall-cmd --reload
+  ```
+
 ---
 
 ## 2. Install binaries and prepare directories
@@ -68,7 +87,7 @@ Perform these steps on **all three nodes**:
 
 ### 2.1 Download and install the latest release from GitHub
 
-Download the pre-built `bun` (node agent) and `relish` (CLI) binaries for your system architecture (`x86_64` or `aarch64`) from the GitHub repository release page:
+Download the pre-built `bun` (node agent) and `relish` (CLI) binaries for your system architecture (`x86_64` or `aarch64`) from the GitHub repository release page, and verify the downloads against `SHA256SUMS`:
 
 ```sh
 # Detect host architecture
@@ -79,17 +98,22 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-# Download the latest Linux release binaries from GitHub
-# Future URL
-# BASE_URL="https://github.com/reliaburger/reliaburger/releases/latest/download"
-BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-36114757933-1"
-curl -fsSL -o /tmp/bun "${BASE_URL}/bun-linux-${ARCH}"
-curl -fsSL -o /tmp/relish "${BASE_URL}/relish-linux-${ARCH}"
+# Release version to install (e.g. v0.1.0 or vX.Y.Z)
+VERSION="v0.1.0"
+BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
+
+# Download binaries and SHA256SUMS into /tmp
+curl -fsSL -o /tmp/bun-linux-${ARCH} "${BASE_URL}/bun-linux-${ARCH}"
+curl -fsSL -o /tmp/relish-linux-${ARCH} "${BASE_URL}/relish-linux-${ARCH}"
+curl -fsSL -o /tmp/SHA256SUMS "${BASE_URL}/SHA256SUMS"
+
+# Verify download integrity against the release checksums
+(cd /tmp && sha256sum --check --ignore-missing SHA256SUMS)
 
 # Install to /usr/local/bin
-sudo install -m 0755 /tmp/bun /usr/local/bin/bun
-sudo install -m 0755 /tmp/relish /usr/local/bin/relish
-rm -f /tmp/bun /tmp/relish
+sudo install -m 0755 /tmp/bun-linux-${ARCH} /usr/local/bin/bun
+sudo install -m 0755 /tmp/relish-linux-${ARCH} /usr/local/bin/relish
+rm -f /tmp/bun-linux-${ARCH} /tmp/relish-linux-${ARCH} /tmp/SHA256SUMS
 ```
 
 Verify that the binaries are installed and executable:
@@ -236,7 +260,7 @@ Verify that the CLI can authenticate as a normal user:
 relish status
 ```
 
-### 3.5 (Optional) Open API listener to all interfaces
+### 3.5 Open API listener to all interfaces
 
 Now that the token store is populated, if you want Node 1's API to be accessible directly over the network (e.g. from your laptop at `https://192.168.0.101:9117`):
 
@@ -269,10 +293,12 @@ Copy the key to Node 2 and Node 3:
 
 ```sh
 # Copy to Node 2
-sudo scp /etc/reliaburger/prod-master.key user@192.168.0.102:/tmp/prod-master.key
+sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.102 \
+  'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
 
 # Copy to Node 3
-sudo scp /etc/reliaburger/prod-master.key user@192.168.0.103:/tmp/prod-master.key
+sudo cat /etc/reliaburger/prod-master.key | ssh user@192.168.0.102 \
+  'sudo install -m 0600 -o root -g root /dev/stdin /etc/reliaburger/prod-master.key'
 ```
 
 > **Note**: `prod` is the name of reliaburger cluster initialized at the beginning of this procedure.
@@ -297,7 +323,9 @@ sudo chmod 0600 /etc/reliaburger/prod-master.key
 
 ### 4.2 Create single-use join tokens and get the Root CA fingerprint
 
-#### 1. Calculate the Root CA fingerprint
+#### 1. (Optional) Calculate the Root CA fingerprint
+
+In case you didn't take note of the Root CA fingerprint during the `relish init` step.
 
 On **Node 1**, compute the SHA-256 fingerprint of `root-ca.crt` (or omit `--ca-fingerprint` during join):
 
@@ -329,13 +357,13 @@ On **Node 2 (`192.168.0.102`)**:
      --token "<TOKEN_FOR_NODE_02>" \
      --node-id node-02 \
      --identity-dir /etc/reliaburger/identity \
-     --ca-fingerprint "$ROOT_CA_FINGERPRINT" \
+     --ca-fingerprint "<ROOT_CA_FINGERPRINT>" \
      https://192.168.0.101:9117
    ```
 
 2. Create `/etc/reliaburger/node.toml` on **Node 2**:
 
-   ```toml
+```ini
    [node]
    name = "node-02"
 
@@ -392,7 +420,7 @@ On **Node 3 (`192.168.0.103`)**:
 
 2. Create `/etc/reliaburger/node.toml` on **Node 3**:
 
-   ```toml
+   ```ini
    [node]
    name = "node-03"
 
@@ -457,13 +485,20 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-# Download and install relish for macOS
-# Future URL
-# BASE_URL="https://github.com/reliaburger/reliaburger/releases/latest/download"
-BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-36114757933-1"
-curl -fsSL -o /tmp/relish "${BASE_URL}/relish-macos-${ARCH}"
-sudo install -m 0755 /tmp/relish /usr/local/bin/relish
-rm -f /tmp/relish
+# Release version to install (e.g. v0.1.0 or vX.Y.Z)
+VERSION="v0.1.0"
+BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
+
+# Download relish binary and SHA256SUMS into /tmp
+curl -fsSL -o /tmp/relish-macos-${ARCH} "${BASE_URL}/relish-macos-${ARCH}"
+curl -fsSL -o /tmp/SHA256SUMS "${BASE_URL}/SHA256SUMS"
+
+# Verify download integrity against the release checksums
+(cd /tmp && shasum -a 256 --check --ignore-missing SHA256SUMS)
+
+# Install to /usr/local/bin
+sudo install -m 0755 /tmp/relish-macos-${ARCH} /usr/local/bin/relish
+rm -f /tmp/relish-macos-${ARCH} /tmp/SHA256SUMS
 
 # Verify installation
 relish --version
@@ -473,35 +508,11 @@ relish --version
 
 #### On Windows PC
 
-##### Method 1: Using Windows Subsystem for Linux (WSL2 / Ubuntu) — Recommended
-If you use WSL2, open your WSL terminal (e.g. Ubuntu) and install Relish using the Linux installer:
+Native Windows support is on the roadmap. For now, run `relish` inside **WSL2** (Windows Subsystem for Linux) using the Linux installer:
+
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 ```
-
-##### Method 2: Native Windows (PowerShell & Git Bash)
-On a Windows PC with PowerShell 5.1+ or PowerShell 7+:
-
-1. Create a tools directory in your user profile:
-   ```powershell
-   New-Item -ItemType Directory -Force -Path "$HOME\.reliaburger\bin"
-   ```
-
-2. Download the Windows binary (or use the binary compiled from source via `cargo build --release --bin relish`):
-   ```powershell
-   # If downloading from GitHub Releases or copying from your build host:
-   Invoke-WebRequest -Uri "https://github.com/reliaburger/reliaburger/releases/latest/download/relish-windows-x86_64.exe" -OutFile "$HOME\.reliaburger\bin\relish.exe"
-   ```
-
-3. Add `~/.reliaburger/bin` to your user `PATH` if it is not already present:
-   ```powershell
-   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";$HOME\.reliaburger\bin", "User")
-   ```
-
-4. Verify in a new PowerShell window:
-   ```powershell
-   relish --version
-   ```
 
 ---
 
@@ -513,13 +524,6 @@ Copy the cluster Root CA certificate generated on Node 1 to your laptop so `reli
 ```sh
 mkdir -p ~/.reliaburger
 scp user@192.168.0.101:/etc/reliaburger/identity/root-ca.crt ~/.reliaburger/root-ca.crt
-```
-
-#### On Windows (PowerShell):
-OpenSSH client is built into Windows 10/11:
-```powershell
-New-Item -ItemType Directory -Force -Path "$HOME\.reliaburger"
-scp user@192.168.0.101:/etc/reliaburger/identity/root-ca.crt "$HOME\.reliaburger\root-ca.crt"
 ```
 
 ---
@@ -535,21 +539,6 @@ export RELIABURGER_CA_CERT="$HOME/.reliaburger/root-ca.crt"
 export RELIABURGER_TOKEN="<ADMIN_TOKEN>"
 ```
 *(Tip: Add these exports to your `~/.zshrc` or `~/.bashrc` to make them persistent across terminal sessions.)*
-
-#### On Windows (PowerShell):
-For the current PowerShell session:
-```powershell
-$env:RELIABURGER_ENDPOINT = "https://192.168.0.101:9117"
-$env:RELIABURGER_CA_CERT = "$HOME\.reliaburger\root-ca.crt"
-$env:RELIABURGER_TOKEN = "<ADMIN_TOKEN>"
-```
-
-To set them permanently for your Windows user profile:
-```powershell
-[Environment]::SetEnvironmentVariable("RELIABURGER_ENDPOINT", "https://192.168.0.101:9117", "User")
-[Environment]::SetEnvironmentVariable("RELIABURGER_CA_CERT", "$HOME\.reliaburger\root-ca.crt", "User")
-[Environment]::SetEnvironmentVariable("RELIABURGER_TOKEN", "<ADMIN_TOKEN>", "User")
-```
 
 ---
 
@@ -589,7 +578,7 @@ Now deploy a containerized HTTP web service across the 3-node cluster directly f
 
 Save the following configuration as `hello.toml` on your laptop:
 
-```toml
+```ini
 [app.hello]
 image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
 command = [
